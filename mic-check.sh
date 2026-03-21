@@ -3,7 +3,7 @@
 #  PRE-CALL MIC CHECK
 #  mit USB / Bluetooth Auto-Erkennung
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION="1.4.3"
+VERSION="1.4.4"
 export LANG=C.UTF-8
 
 # --- CONFIG ---
@@ -11,7 +11,7 @@ CHECK_SECS=3
 RATE=44100
 CHANNELS=1
 BITS=16
-BAR_W=35
+BAR_W=25
 MAX_RESTARTS=2
 LOG_FILE="${HOME}/.mic-check.log"
 # --------------
@@ -476,6 +476,7 @@ cleanup() {
     rm -f "$FILE" 2>/dev/null
     [[ -n "$PLAY_PIPE" ]] && rm -f "$PLAY_PIPE" 2>/dev/null
     [[ -n "$MIC_PIPE" ]]  && rm -f "$MIC_PIPE"  2>/dev/null
+    [[ -n "$WAIT_PIPE" ]] && rm -f "$WAIT_PIPE" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -752,118 +753,81 @@ clear
 tput civis
 
 KEEP_LABEL=""
-(( KEEP_DEVICES )) && KEEP_LABEL="  ${DIM}(--keep)${NC}"
-
-echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  🎧🎙 PRE-CALL MIC CHECK${NC}${KEEP_LABEL}  ${DIM}v${VERSION}${NC}"
-echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+(( KEEP_DEVICES )) && KEEP_LABEL=" ${DIM}(--keep)${NC}"
 
 detect_devices
 detect_audio_server
 detect_bt_codec
 
-# Audio-Server Info
-AUDIO_SRV_LABEL=""
+# --- Audio-Server Label ---
+AUDIO_SRV_SHORT=""
 case "$AUDIO_SERVER" in
-    pipewire+pulse)
-        AUDIO_SRV_LABEL="${GREEN}PipeWire${NC} ${DIM}(+ PulseAudio-Compat)${NC}" ;;
-    pipewire)
-        AUDIO_SRV_LABEL="${GREEN}PipeWire${NC}" ;;
-    pulseaudio)
-        AUDIO_SRV_LABEL="${YELLOW}PulseAudio${NC}" ;;
-    *)
-        AUDIO_SRV_LABEL="${RED}Unbekannt${NC}" ;;
+    pipewire+pulse|pipewire) AUDIO_SRV_SHORT="PipeWire" ;;
+    pulseaudio)              AUDIO_SRV_SHORT="PulseAudio" ;;
+    *)                       AUDIO_SRV_SHORT="?" ;;
 esac
-if [[ -n "$AUDIO_SERVER_VERSION" ]]; then
-    AUDIO_SRV_LABEL="${AUDIO_SRV_LABEL} ${DIM}v${AUDIO_SERVER_VERSION}${NC}"
-fi
-if [[ -n "$SESSION_MANAGER" ]]; then
-    AUDIO_SRV_LABEL="${AUDIO_SRV_LABEL} ${DIM}+ ${SESSION_MANAGER}${NC}"
-fi
+[[ -n "$AUDIO_SERVER_VERSION" ]] && AUDIO_SRV_SHORT="${AUDIO_SRV_SHORT} v${AUDIO_SERVER_VERSION}"
+[[ -n "$SESSION_MANAGER" ]] && AUDIO_SRV_SHORT="${AUDIO_SRV_SHORT} + ${SESSION_MANAGER}"
 
-echo -e "  Audio:     ${AUDIO_SRV_LABEL}"
-echo ""
-
-# Mic-Info
+# --- Mic/Out Info ---
 MIC_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)
 MIC_PCT=$(echo "$MIC_VOL" | awk '{printf "%.0f", $2*100}')
 MIC_MUTED=$(echo "$MIC_VOL" | grep -o "MUTED")
 
-# Ausgabe-Info
 OUT_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
 OUT_PCT=$(echo "$OUT_VOL" | awk '{printf "%.0f", $2*100}')
 OUT_MUTED=$(echo "$OUT_VOL" | grep -o "MUTED")
 
-# Status-Icons
+# --- Status-Kurzform ---
 if [[ -n "$MIC_MUTED" ]]; then
-    MIC_STATUS="${BG_RED}${BOLD} ✗ STUMM ${NC}"
+    MIC_SHORT="${BG_RED}${BOLD}STUMM${NC}"
 elif (( MIC_PCT < 20 )); then
-    MIC_STATUS="${YELLOW}⚠ Leise (${MIC_PCT}%)${NC}"
+    MIC_SHORT="${YELLOW}${MIC_PCT}%${NC}"
 else
-    MIC_STATUS="${GREEN}✓ ${MIC_PCT}%${NC}"
+    MIC_SHORT="${GREEN}${MIC_PCT}%${NC}"
 fi
 
 if [[ -n "$OUT_MUTED" ]]; then
-    OUT_STATUS="${BG_RED}${BOLD} ✗ STUMM ${NC}"
+    OUT_SHORT="${BG_RED}${BOLD}STUMM${NC}"
 elif (( OUT_PCT < 20 )); then
-    OUT_STATUS="${YELLOW}⚠ Leise (${OUT_PCT}%)${NC}"
+    OUT_SHORT="${YELLOW}${OUT_PCT}%${NC}"
 else
-    OUT_STATUS="${GREEN}✓ ${OUT_PCT}%${NC}"
+    OUT_SHORT="${GREEN}${OUT_PCT}%${NC}"
 fi
 
 SRC_LABEL=$(connection_label "$CURRENT_SRC_TYPE")
 SINK_LABEL=$(connection_label "$CURRENT_SINK_TYPE")
+MIC_NAME=$(extract_name "$DEFAULT_SRC_LINE")
+OUT_NAME=$(extract_name "$DEFAULT_SINK_LINE")
 
-echo -e "  Mikrofon:  ${DIM}$(extract_display "$DEFAULT_SRC_LINE")${NC}"
-echo -e "             ${MIC_STATUS}  via ${SRC_LABEL}"
-echo ""
-echo -e "  Ausgabe:   ${DIM}$(extract_display "$DEFAULT_SINK_LINE")${NC}"
-echo -e "             ${OUT_STATUS}  via ${SINK_LABEL}"
-echo ""
-
-# Verfügbare externe Quellen
-if [[ -n "$USB_SRC_ID" || -n "$BT_SRC_ID" ]]; then
-    echo -e "  ${DIM}Verfügbar:${NC}"
-    if [[ -n "$USB_SRC_ID" ]]; then
-        active_mark=""
-        [[ "$CURRENT_SRC_TYPE" == "usb" ]] && active_mark=" ${GREEN}← aktiv${NC}"
-        echo -e "    ${GREEN}●${NC} USB:  $(extract_display "$USB_SRC_LINE")${active_mark}"
-    fi
-    if [[ -n "$BT_SRC_ID" ]]; then
-        active_mark=""
-        [[ "$CURRENT_SRC_TYPE" == "bluetooth" ]] && active_mark=" ${CYAN}← aktiv${NC}"
-        echo -e "    ${CYAN}●${NC} BT:   $(extract_display "$BT_SRC_LINE")${active_mark}"
-    fi
-    echo ""
+# --- BT Codec Kurzform ---
+BT_CODEC_SHORT=""
+if [[ -n "$BT_CODEC" ]]; then
+    codec_color="$GREEN"
+    [[ "$BT_CODEC" == "CVSD" ]] && codec_color="$RED"
+    [[ "$BT_CODEC" == "SBC" || "$BT_CODEC" == "SBC-XQ" || "$BT_CODEC" == "AAC" ]] && codec_color="$YELLOW"
+    BT_CODEC_SHORT="Codec: ${codec_color}${BT_CODEC}${NC}"
 fi
 
-# Bluetooth Codec/Profil-Info
-if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]]; then
-    echo -e "  ${BOLD}Bluetooth-Profil:${NC}"
-    if [[ -n "$BT_PROFILE_LABEL" ]]; then
-        echo -e "    Profil:  ${CYAN}${BT_PROFILE_LABEL}${NC}"
-    fi
-    if [[ -n "$BT_CODEC" ]]; then
-        codec_color="$GREEN"
-        [[ "$BT_CODEC" == "CVSD" ]] && codec_color="$RED"
-        [[ "$BT_CODEC" == "SBC" || "$BT_CODEC" == "SBC-XQ" || "$BT_CODEC" == "AAC" ]] && codec_color="$YELLOW"
-        echo -e "    Codec:   ${codec_color}${BT_CODEC}${NC}"
-    fi
-    if [[ ${#BT_ALL_PROFILES[@]} -gt 0 ]]; then
-        echo -e "    ${DIM}Verfügbare Profile:${NC}"
-        for p in "${BT_ALL_PROFILES[@]}"; do
-            marker=""
-            [[ "$p" == "$BT_PROFILE" ]] && marker=" ${CYAN}← aktiv${NC}"
-            echo -e "      ${DIM}• ${p}${NC}${marker}"
-        done
-    fi
-    if [[ -n "$BT_CODEC_WARNING" && KEEP_DEVICES -eq 1 ]]; then
-        echo ""
-        echo -e "    ${YELLOW}⚠ ${BT_CODEC_WARNING}${NC}"
-    fi
+# ━━━ HEADER (Wide Compact) ━━━
+echo -e "  ${BOLD}🎧🎙 MIC CHECK${NC}${KEEP_LABEL} ${DIM}v${VERSION}${NC} ─── ${DIM}${AUDIO_SRV_SHORT}${NC} ─── ${BOLD}${MIC_NAME}${NC} ${DIM}[${NC}${SRC_LABEL}${DIM}]${NC}"
+echo -e "  Mic: ${MIC_SHORT}  Out: ${OUT_SHORT}  ${BT_CODEC_SHORT}"
+
+# --- BT-Profile (kompakt mit Emojis) ---
+if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]] && [[ ${#BT_ALL_PROFILES[@]} -gt 0 ]]; then
     echo ""
+    echo -e "  ${DIM}BT-Profile:${NC}"
+    for p in "${BT_ALL_PROFILES[@]}"; do
+        marker=""
+        [[ "$p" == "$BT_PROFILE" ]] && marker=" ${CYAN}← aktiv${NC}"
+        if echo "$p" | grep -qi 'headset\|handsfree\|hfp\|head.unit'; then
+            echo -e "    🎧🎙 ${DIM}${p}${NC}${marker}"
+        else
+            echo -e "    🎧  ${DIM}${p}${NC}${marker}"
+        fi
+    done
 fi
+echo ""
 
 # ━━━ SMART ROUTING (nur ohne --keep) ━━━
 if (( KEEP_DEVICES == 0 )); then
@@ -933,42 +897,71 @@ fi
 
 # Bei MUTE abbrechen
 if [[ -n "$MIC_MUTED" ]]; then
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo -e "  ${RED}${BOLD}Mikrofon ist stumm!${NC}"
-    echo -e "  ${DIM}Entstummen:${NC} wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0"
+    echo -e "  ${RED}${BOLD}✗ Mikrofon ist stumm!${NC}  ${DIM}→ wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0${NC}"
     echo ""
     tput cnorm
     exit 1
 fi
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PHASE 1.5:  Rauschboden (Noise Floor)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo -e "  ${BOLD}🔇 Rauschboden-Messung${NC} – Bitte 1s still sein..."
+# ━━━ PHASE 1.5: Noise Floor (kompakt) ━━━
+echo -e "  ${DIM}Noise Floor:${NC} \c"
 measure_noise_floor
 
 if [[ "$NOISE_DB" == "-inf" ]]; then
-    echo -e "  Noise Floor: ${GREEN}Kein Rauschen erkannt${NC}"
+    echo -e "${GREEN}Kein Rauschen${NC}"
 elif (( NOISE_PEAK < 200 )); then
-    echo -e "  Noise Floor: ${GREEN}${NOISE_DB} dB${NC} ${DIM}(sehr gut)${NC}"
+    echo -e "${GREEN}${NOISE_DB} dB${NC} ${DIM}(sehr gut)${NC}"
 elif (( NOISE_PEAK < 800 )); then
-    echo -e "  Noise Floor: ${YELLOW}${NOISE_DB} dB${NC} ${DIM}(akzeptabel)${NC}"
+    echo -e "${YELLOW}${NOISE_DB} dB${NC} ${DIM}(akzeptabel)${NC}"
 else
-    echo -e "  Noise Floor: ${RED}${NOISE_DB} dB${NC} ${DIM}(zu hoch – Umgebung zu laut?)${NC}"
+    echo -e "${RED}${NOISE_DB} dB${NC} ${DIM}(zu hoch)${NC}"
 fi
 echo ""
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PHASE 2:  Live-Pegel
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# ━━━ PHASE 2: Live-Pegel (dynamisch, warte auf Signal) ━━━
+echo -e "  ${BOLD}🎙 Pegeltest${NC} – Warte auf Pegel..."
+echo -e "  🎙 INPUT  $(draw_vu 0)          🔊 OUTPUT $(draw_vu 0)"
 echo ""
-echo -e "  ${BOLD}🎙  Pegeltest${NC} – Sprich ${CHECK_SECS}s lang..."
-echo ""
-echo -e "  INPUT  $(draw_vu 0)"
+
+# --- Phase 2a: Warte bis zu 3s auf Signal ---
+WAIT_PIPE=$(mktemp -u /tmp/micwait.XXXXXX)
+mkfifo "$WAIT_PIPE"
+
+rec -q -c $CHANNELS -r $RATE -b $BITS -e signed-integer -t raw - \
+    trim 0 3 2>/dev/null > "$WAIT_PIPE" &
+WAIT_PID=$!
+
+exec 5<"$WAIT_PIPE"
+
+SIGNAL_DETECTED=0
+WAIT_MAX=$(( 3 * 5 ))
+wait_i=0
+
+while (( wait_i < WAIT_MAX )); do
+    chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&5 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
+    peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
+    [[ -z "$peak" ]] && peak=0
+
+    printf "\033[2A\r"
+    printf "  🎙 INPUT  $(draw_vu "$peak")  ${DIM}Warte...${NC}  "
+    printf "\n\n"
+
+    if (( peak > 500 )); then
+        SIGNAL_DETECTED=1
+        break
+    fi
+    (( wait_i++ ))
+done
+
+exec 5<&-
+kill "$WAIT_PID" 2>/dev/null
+wait "$WAIT_PID" 2>/dev/null
+rm -f "$WAIT_PIPE"
+
+# --- Phase 2b: Aufnahme mit Countdown ---
+printf "\033[3A\r"
+echo -e "  ${BOLD}🎙 Pegeltest${NC} – Sprich ${CHECK_SECS}s lang...                              "
+printf "  🎙 INPUT  $(draw_vu 0)          🔊 OUTPUT $(draw_vu 0)\n"
 echo ""
 
 MIC_PIPE=$(mktemp -u /tmp/micpipe.XXXXXX)
@@ -994,7 +987,7 @@ while (( chunk_i < CHUNK_COUNT )); do
     remaining=$(( CHECK_SECS - chunk_i / 5 ))
 
     printf "\033[2A\r"
-    printf "  INPUT  $(draw_vu "$peak")  ${DIM}%ds${NC}  " "$remaining"
+    printf "  🎙 INPUT  $(draw_vu "$peak")  ${DIM}%ds${NC}       🔊 OUTPUT $(draw_vu 0)" "$remaining"
     printf "\n\n"
 
     (( chunk_i++ ))
@@ -1006,16 +999,12 @@ rm -f "$MIC_PIPE"
 MIC_PIPE=""
 
 # ━━━ PEGEL-BEWERTUNG ━━━
-echo ""
-
 if (( max_peak < 300 )); then
     echo -e "  ${RED}${BOLD}✗ KEIN SIGNAL${NC} – Mic empfängt nichts!"
     echo ""
 
     if (( KEEP_DEVICES == 1 )); then
         echo -e "  ${DIM}(--keep aktiv, kein Gerätewechsel)${NC}"
-        echo ""
-        echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo ""
         echo -e "  ${BG_RED}${BOLD} ✗ MIKROFON PROBLEM – NICHT ANRUFEN ${NC}"
         echo ""
@@ -1027,8 +1016,7 @@ if (( max_peak < 300 )); then
     SWITCHED=0
 
     if [[ -n "$USB_SRC_ID" && "$CURRENT_SRC_TYPE" != "usb" ]]; then
-        echo -e "  ${GREEN}●${NC} USB-Gerät verfügbar: ${BOLD}${USB_SRC_NAME}${NC}"
-        echo ""
+        echo -e "  ${GREEN}●${NC} USB verfügbar: ${BOLD}${USB_SRC_NAME}${NC}"
         read -r -p "    Auf USB umschalten? [J/n] " answer
         answer=${answer:-j}
         if [[ "$answer" =~ ^[jJyY]$ ]]; then
@@ -1039,8 +1027,7 @@ if (( max_peak < 300 )); then
     fi
 
     if (( SWITCHED == 0 )) && [[ -n "$BT_SRC_ID" && "$CURRENT_SRC_TYPE" != "bluetooth" ]]; then
-        echo -e "  ${CYAN}●${NC} Bluetooth verfügbar: ${BOLD}${BT_SRC_NAME}${NC}"
-        echo ""
+        echo -e "  ${CYAN}●${NC} BT verfügbar: ${BOLD}${BT_SRC_NAME}${NC}"
         read -r -p "    Auf Bluetooth umschalten? [J/n] " answer
         answer=${answer:-j}
         if [[ "$answer" =~ ^[jJyY]$ ]]; then
@@ -1051,13 +1038,7 @@ if (( max_peak < 300 )); then
     fi
 
     if (( SWITCHED == 0 )); then
-        echo ""
-        echo -e "  ${DIM}Tipps:${NC}"
-        echo -e "  ${DIM}  → Kabel/Adapter prüfen${NC}"
-        echo -e "  ${DIM}  → Physischen Mute-Schalter prüfen${NC}"
-        echo -e "  ${DIM}  → ./mic-check.sh --debug${NC}"
-        echo ""
-        echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo -e "  ${DIM}Tipps: Kabel prüfen · Mute-Schalter · ./mic-check.sh --debug${NC}"
         echo ""
         echo -e "  ${BG_RED}${BOLD} ✗ MIKROFON PROBLEM – NICHT ANRUFEN ${NC}"
         echo ""
@@ -1066,58 +1047,15 @@ if (( max_peak < 300 )); then
     fi
 
 elif (( max_peak < 2000 )); then
-    echo -e "  ${YELLOW}⚠ SEHR LEISE${NC} – Pegel zu niedrig für Anrufe"
-    echo -e "  ${DIM}  → wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 100%${NC}"
     VERDICT="WARN"
 elif (( max_peak > 30000 )); then
-    echo -e "  ${YELLOW}⚠ ZU LAUT / CLIPPING${NC} – Pegel reduzieren"
-    echo -e "  ${DIM}  → wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 70%${NC}"
     VERDICT="WARN"
 else
-    echo -e "  ${GREEN}${BOLD}✓ PEGEL OK${NC}"
     VERDICT="OK"
 fi
 
-echo ""
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PHASE 2.5:  SNR + Frequenzgang
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if [[ -n "$VERDICT" && "$VERDICT" != "" ]]; then
-    # SNR berechnen
-    calculate_snr
-    if [[ -n "$SNR_DB" ]]; then
-        local_snr_int=${SNR_DB%%.*}
-        snr_color="$GREEN"
-        (( local_snr_int < 25 )) && snr_color="$YELLOW"
-        (( local_snr_int < 15 )) && snr_color="$RED"
-        echo -e "  Signal/Rausch: ${snr_color}${SNR_DB} dB SNR${NC} ${DIM}(${SNR_RATING})${NC}"
-    fi
-
-    # Frequenzgang prüfen
-    check_frequency_response
-    if [[ -n "$FREQ_OK" ]]; then
-        if [[ "$FREQ_OK" == "OK" ]]; then
-            echo -e "  Frequenzgang:  ${GREEN}${FREQ_BANDWIDTH}${NC} ${DIM}(gut für Sprache)${NC}"
-        else
-            echo -e "  Frequenzgang:  ${YELLOW}${FREQ_BANDWIDTH}${NC}"
-            [[ -n "$FREQ_WARNING" ]] && echo -e "                 ${YELLOW}⚠ ${FREQ_WARNING}${NC}"
-        fi
-    fi
-    echo ""
-fi
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PHASE 3:  Kurze Wiedergabe
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ PHASE 3: Wiedergabe (auf gleicher Zeile wie INPUT) ━━━
 if [[ -s "$FILE" && -n "$VERDICT" ]]; then
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo -e "  ${BOLD}🔊 Wiedergabe${NC} – So klingst du:"
-    echo ""
-    echo -e "  OUTPUT $(draw_vu 0)"
-    echo ""
-
     PLAY_PIPE=$(mktemp -u /tmp/playpipe.XXXXXX)
     mkfifo "$PLAY_PIPE"
 
@@ -1129,6 +1067,7 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
 
     exec 4<"$PLAY_PIPE"
 
+    # INPUT final peak anzeigen, OUTPUT live
     while true; do
         chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&4 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
         peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
@@ -1139,7 +1078,7 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
         fi
 
         printf "\033[2A\r"
-        printf "  OUTPUT $(draw_vu "$peak")     "
+        printf "  🎙 INPUT  $(draw_vu "$max_peak")  ${GREEN}✓${NC}       🔊 OUTPUT $(draw_vu "$peak")"
         printf "\n\n"
     done
 
@@ -1147,22 +1086,62 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
     wait "$PLAY_PID" 2>/dev/null
     rm -f "$PLAY_PIPE"
     PLAY_PIPE=""
+fi
 
+# Finale Zeile mit beiden VU-Metern (statisch)
+printf "\033[2A\r"
+if [[ -n "$VERDICT" ]]; then
+    printf "  🎙 INPUT  $(draw_vu "$max_peak")  ${GREEN}✓${NC}       🔊 OUTPUT $(draw_vu "$max_peak")"
+else
+    printf "  🎙 INPUT  $(draw_vu "$max_peak")           🔊 OUTPUT $(draw_vu 0)"
+fi
+printf "\n\n"
+
+# ━━━ SNR + Frequenzgang (kompakt, eine Zeile) ━━━
+if [[ -n "$VERDICT" ]]; then
+    calculate_snr
+    check_frequency_response
+
+    STATS_LINE="  "
+
+    # Pegel-Bewertung
+    if [[ "$VERDICT" == "OK" ]]; then
+        STATS_LINE+="${GREEN}✓ Pegel OK${NC}"
+    elif (( max_peak < 2000 )); then
+        STATS_LINE+="${YELLOW}⚠ Sehr leise${NC}"
+    else
+        STATS_LINE+="${YELLOW}⚠ Clipping${NC}"
+    fi
+
+    # SNR
+    if [[ -n "$SNR_DB" ]]; then
+        local_snr_int=${SNR_DB%%.*}
+        snr_color="$GREEN"
+        (( local_snr_int < 25 )) && snr_color="$YELLOW"
+        (( local_snr_int < 15 )) && snr_color="$RED"
+        STATS_LINE+="  │  SNR: ${snr_color}${SNR_DB}dB${NC} ${DIM}(${SNR_RATING})${NC}"
+    fi
+
+    # Frequenz
+    if [[ -n "$FREQ_OK" ]]; then
+        if [[ "$FREQ_OK" == "OK" ]]; then
+            STATS_LINE+="  │  Freq: ${GREEN}>4kHz ✓${NC}"
+        else
+            STATS_LINE+="  │  Freq: ${YELLOW}≤4kHz${NC}"
+        fi
+    fi
+
+    echo -e "$STATS_LINE"
     echo ""
 fi
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ERGEBNIS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
+# ━━━ ERGEBNIS ━━━
 case "$VERDICT" in
     OK)
-        echo -e "  ${BG_GREEN}${BOLD} ✓ BEREIT FÜR DEN ANRUF ${NC}"
+        echo -e "  ═══════════════ ${BG_GREEN}${BOLD} ✅ BEREIT FÜR DEN ANRUF ${NC} ═══════════════"
         ;;
     WARN)
-        echo -e "  ${YELLOW}${BOLD}⚠  FUNKTIONIERT, ABER PEGEL ANPASSEN${NC}"
+        echo -e "  ═══════════════ ${YELLOW}${BOLD} ⚠  PEGEL ANPASSEN ${NC} ═══════════════════"
         ;;
 esac
 

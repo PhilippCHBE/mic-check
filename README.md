@@ -25,33 +25,18 @@
 ## Screenshot
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  🎧🎙 PRE-CALL MIC CHECK  v1.4.3
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🎧🎙 MIC CHECK v1.4.4 ─── PipeWire v1.6.2 ─── OnePlus Buds Pro 2 [BT]
+  Mic: 100%  Out: 47%  Codec: mSBC ✓
+  Profile: 🎧 a2dp-sink-sbc · 🎧 a2dp-sink-sbc_xq · 🎧 a2dp-sink · 🎧🎙 headset-head-unit ← aktiv
+  Noise Floor: -52.3 dB (sehr gut)
 
-  Audio:     PipeWire (+ PulseAudio-Compat) v1.6.2 + wireplumber
+  🎙 Pegeltest – Sprich 3s lang...
+  🎙 INPUT  [█████████████████░░░░░░░░] -12.3 dB  ✓       🔊 OUTPUT [██████████████░░░░░░░░░░░] -15.1 dB
 
-  Mikrofon:  109. OnePlus Buds Pro 2 [vol: 1.00]
-             ✓ 100%  via BT
+  ✓ Pegel OK  │  SNR: 40.0dB (exzellent)  │  Freq: >4kHz ✓
 
-  Ausgabe:   104. OnePlus Buds Pro 2 [vol: 0.47]
-             ✓ 47%  via BT
-
-  Bluetooth-Profil:
-    Profil:  Headset (HSP/HFP)
-    Codec:   CVSD
-    Verfügbare Profile:
-      • a2dp-sink-sbc
-      • a2dp-sink-sbc_xq
-      • a2dp-sink
-      • headset-head-unit-cvsd ← aktiv
-      • headset-head-unit
-
-    ⚠ CVSD hat niedrige Qualität (8kHz). mSBC wäre besser.
-
-    ⏳ Wechsle zu headset-head-unit in 3s – [Leertaste] zum Überspringen
-    ✓ Profil umgeschaltet auf headset-head-unit (system-weit)
-    ↻ Starte Mic-Check neu...
+  ═══════════════ ✅ BEREIT FÜR DEN ANRUF ═══════════════
+  Gespeichert in ~/.mic-check.log
 ```
 
 ## Installation
@@ -149,6 +134,7 @@ The script detects which profile is active and **automatically switches system-w
 - Rates: very good / acceptable / too high
 
 ### Phase 2 – Live Level Test
+- **Dynamic signal detection**: Waits up to 3s for you to start speaking before starting the countdown
 - Records 3 seconds via `sox` (`rec`)
 - Displays real-time VU-meter with peak levels in dB
 - Evaluates: no signal / too quiet / OK / clipping
@@ -159,12 +145,12 @@ The script detects which profile is active and **automatically switches system-w
 
 ### Phase 3 – Playback
 - Plays back the recording through your speakers/headphones
-- Shows output VU-meter during playback
+- Shows **side-by-side INPUT/OUTPUT VU-meters** on the same line
 - You can judge your own audio quality
 
 ### Verdict & Logging
 - **✅ BEREIT FÜR DEN ANRUF** – Ready for the call
-- **⚠ FUNKTIONIERT, ABER PEGEL ANPASSEN** – Works, but adjust level
+- **⚠ PEGEL ANPASSEN** – Works, but adjust level
 - **❌ MIKROFON PROBLEM – NICHT ANRUFEN** – Mic problem, don't call
 - Results are saved to `~/.mic-check.log` with timestamp, device, codec, SNR, noise floor, peak level, and frequency check result
 - View history with `./mic-check.sh --history`
