@@ -25,18 +25,21 @@
 ## Screenshot
 
 ```
-  🎧🎙 MIC CHECK v1.4.4 ─── PipeWire v1.6.2 ─── OnePlus Buds Pro 2 [BT]
-  Mic: 100%  Out: 47%  Codec: mSBC ✓
-  Profile: 🎧 a2dp-sink-sbc · 🎧 a2dp-sink-sbc_xq · 🎧 a2dp-sink · 🎧🎙 headset-head-unit ← aktiv
-  Noise Floor: -52.3 dB (sehr gut)
+  🎧🎙 MIC CHECK v1.4.4 ─── PipeWire v1.6.2 + wireplumber ─── OnePlus Buds Pro 2 [BT]
+  Mic: 100%  Out: 79%  Codec: mSBC
 
-  🎙 Pegeltest – Sprich 3s lang...
-  🎙 INPUT  [█████████████████░░░░░░░░] -12.3 dB  ✓       🔊 OUTPUT [██████████████░░░░░░░░░░░] -15.1 dB
+  BT-Profile:
+    🎧  a2dp-sink-sbc | a2dp-sink-sbc_xq | a2dp-sink
+    🎧🎙 headset-head-unit-cvsd | headset-head-unit (aktiv)
 
-  ✓ Pegel OK  │  SNR: 40.0dB (exzellent)  │  Freq: >4kHz ✓
+  🔇 Rauschboden-Messung (Bitte 1s still sein...): -52.3 dB (sehr gut)
 
-  ═══════════════ ✅ BEREIT FÜR DEN ANRUF ═══════════════
-  Gespeichert in ~/.mic-check.log
+  🎙 INPUT   [█████████████████░░░░░░░░] -12.3 dB ✓
+  🔊 OUTPUT [██████████████░░░░░░░░░░░] -15.1 dB ✓
+
+  ✓ Pegel OK │ SNR: 40.0dB (exzellent) │ Freq: >4kHz ✓
+
+  ══ ✅ BEREIT FÜR DEN ANRUF  (log:~/.mic-check.log) ══
 ```
 
 ## Installation
@@ -129,14 +132,17 @@ For **microphone usage**, your BT headset must use a **Handsfree (HFP)** profile
 The script detects which profile is active and **automatically switches system-wide** to Handsfree mSBC with a 3-second countdown. Press space to skip.
 
 ### Phase 1.5 – Noise Floor
+- Shows "Bitte 1s still sein..." prompt during measurement
 - Records 1 second of silence
 - Measures ambient noise level in dB
 - Rates: very good / acceptable / too high
 
 ### Phase 2 – Live Level Test
-- **Dynamic signal detection**: Waits up to 3s for you to start speaking before starting the countdown
+- **Single INPUT line** updates in-place through all phases:
+  - `warte auf Pegel...` – waits up to 3s for you to start speaking
+  - `Sprich 3s lang... ⏱ 2s` – live VU-bar with countdown during recording
+  - `-12.3 dB ✓` – final peak result after recording
 - Records 3 seconds via `sox` (`rec`)
-- Displays real-time VU-meter with peak levels in dB
 - Evaluates: no signal / too quiet / OK / clipping
 
 ### Phase 2.5 – Signal Analysis
@@ -145,11 +151,11 @@ The script detects which profile is active and **automatically switches system-w
 
 ### Phase 3 – Playback
 - Plays back the recording through your speakers/headphones
-- Shows **side-by-side INPUT/OUTPUT VU-meters** on the same line
+- **OUTPUT line** appears below INPUT with live VU-meter
 - You can judge your own audio quality
 
 ### Verdict & Logging
-- **✅ BEREIT FÜR DEN ANRUF** – Ready for the call
+- **✅ BEREIT FÜR DEN ANRUF** – Ready for the call (with log path)
 - **⚠ PEGEL ANPASSEN** – Works, but adjust level
 - **❌ MIKROFON PROBLEM – NICHT ANRUFEN** – Mic problem, don't call
 - Results are saved to `~/.mic-check.log` with timestamp, device, codec, SNR, noise floor, peak level, and frequency check result

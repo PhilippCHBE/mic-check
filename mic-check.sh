@@ -488,9 +488,9 @@ draw_vu() {
 
     local db
     if (( peak > 0 )); then
-        db=$(awk "BEGIN{printf \"%6.1f\", 20*log($peak/32768)/log(10)}")
+        db=$(awk "BEGIN{printf \"%.1f\", 20*log($peak/32768)/log(10)}")
     else
-        db="  -inf"
+        db="-inf"
     fi
 
     local color="$GREEN"
@@ -503,6 +503,24 @@ draw_vu() {
     (( rest > 0 )) && empty=$(printf '░%.0s' $(seq 1 "$rest"))
 
     printf "[${color}%s${NC}%s] %s dB" "$bar" "$empty" "$db"
+}
+
+# Nur der Balken ohne dB-Wert
+draw_bar() {
+    local peak="$1"
+    local level=$(( peak * BAR_W / 32768 ))
+    (( level > BAR_W )) && level=$BAR_W
+
+    local color="$GREEN"
+    (( level > BAR_W * 70 / 100 )) && color="$RED"
+    (( level > BAR_W * 45 / 100 && level <= BAR_W * 70 / 100 )) && color="$YELLOW"
+
+    local bar="" empty=""
+    (( level > 0 )) && bar=$(printf '█%.0s' $(seq 1 "$level"))
+    local rest=$(( BAR_W - level ))
+    (( rest > 0 )) && empty=$(printf '░%.0s' $(seq 1 "$rest"))
+
+    printf "[${color}%s${NC}%s]" "$bar" "$empty"
 }
 
 # ━━━ ROBUSTE PARSER ━━━
@@ -813,19 +831,24 @@ fi
 echo -e "  ${BOLD}🎧🎙 MIC CHECK${NC}${KEEP_LABEL} ${DIM}v${VERSION}${NC} ─── ${DIM}${AUDIO_SRV_SHORT}${NC} ─── ${BOLD}${MIC_NAME}${NC} ${DIM}[${NC}${SRC_LABEL}${DIM}]${NC}"
 echo -e "  Mic: ${MIC_SHORT}  Out: ${OUT_SHORT}  ${BT_CODEC_SHORT}"
 
-# --- BT-Profile (kompakt mit Emojis) ---
+# --- BT-Profile (kompakt, gruppiert nach Typ) ---
 if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]] && [[ ${#BT_ALL_PROFILES[@]} -gt 0 ]]; then
     echo ""
     echo -e "  ${DIM}BT-Profile:${NC}"
+    output_line="" headset_line=""
     for p in "${BT_ALL_PROFILES[@]}"; do
-        marker=""
-        [[ "$p" == "$BT_PROFILE" ]] && marker=" ${CYAN}← aktiv${NC}"
+        entry="$p"
+        [[ "$p" == "$BT_PROFILE" ]] && entry="${p} ${CYAN}(aktiv)${NC}${DIM}"
         if echo "$p" | grep -qi 'headset\|handsfree\|hfp\|head.unit'; then
-            echo -e "    🎧🎙 ${DIM}${p}${NC}${marker}"
+            [[ -n "$headset_line" ]] && headset_line+=" | "
+            headset_line+="$entry"
         else
-            echo -e "    🎧  ${DIM}${p}${NC}${marker}"
+            [[ -n "$output_line" ]] && output_line+=" | "
+            output_line+="$entry"
         fi
     done
+    [[ -n "$output_line" ]] && echo -e "    🎧  ${DIM}${output_line}${NC}"
+    [[ -n "$headset_line" ]] && echo -e "    🎧🎙 ${DIM}${headset_line}${NC}"
 fi
 echo ""
 
@@ -904,7 +927,7 @@ if [[ -n "$MIC_MUTED" ]]; then
 fi
 
 # ━━━ PHASE 1.5: Noise Floor (kompakt) ━━━
-echo -e "  ${DIM}Noise Floor:${NC} \c"
+printf "  🔇 Rauschboden-Messung ${DIM}(Bitte 1s still sein...)${NC}: "
 measure_noise_floor
 
 if [[ "$NOISE_DB" == "-inf" ]]; then
@@ -918,10 +941,8 @@ else
 fi
 echo ""
 
-# ━━━ PHASE 2: Live-Pegel (dynamisch, warte auf Signal) ━━━
-echo -e "  ${BOLD}🎙 Pegeltest${NC} – Warte auf Pegel..."
-echo -e "  🎙 INPUT  $(draw_vu 0)          🔊 OUTPUT $(draw_vu 0)"
-echo ""
+# ━━━ PHASE 2: Live-Pegel (INPUT-Zeile als einzige Anzeige) ━━━
+printf "  🎙 INPUT   $(draw_bar 0)  ${DIM}warte auf Pegel...${NC}"
 
 # --- Phase 2a: Warte bis zu 3s auf Signal ---
 WAIT_PIPE=$(mktemp -u /tmp/micwait.XXXXXX)
@@ -942,9 +963,7 @@ while (( wait_i < WAIT_MAX )); do
     peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
     [[ -z "$peak" ]] && peak=0
 
-    printf "\033[2A\r"
-    printf "  🎙 INPUT  $(draw_vu "$peak")  ${DIM}Warte...${NC}  "
-    printf "\n\n"
+    printf "\r  🎙 INPUT   $(draw_bar "$peak")  ${DIM}warte auf Pegel...${NC}\033[K"
 
     if (( peak > 500 )); then
         SIGNAL_DETECTED=1
@@ -959,10 +978,7 @@ wait "$WAIT_PID" 2>/dev/null
 rm -f "$WAIT_PIPE"
 
 # --- Phase 2b: Aufnahme mit Countdown ---
-printf "\033[3A\r"
-echo -e "  ${BOLD}🎙 Pegeltest${NC} – Sprich ${CHECK_SECS}s lang...                              "
-printf "  🎙 INPUT  $(draw_vu 0)          🔊 OUTPUT $(draw_vu 0)\n"
-echo ""
+printf "\r  🎙 INPUT   $(draw_bar 0)  ${DIM}Sprich ${CHECK_SECS}s lang... ⏱ ${CHECK_SECS}s${NC}\033[K"
 
 MIC_PIPE=$(mktemp -u /tmp/micpipe.XXXXXX)
 mkfifo "$MIC_PIPE"
@@ -986,9 +1002,7 @@ while (( chunk_i < CHUNK_COUNT )); do
 
     remaining=$(( CHECK_SECS - chunk_i / 5 ))
 
-    printf "\033[2A\r"
-    printf "  🎙 INPUT  $(draw_vu "$peak")  ${DIM}%ds${NC}       🔊 OUTPUT $(draw_vu 0)" "$remaining"
-    printf "\n\n"
+    printf "\r  🎙 INPUT   $(draw_bar "$peak")  ${DIM}Sprich ${CHECK_SECS}s lang... ⏱ %ds${NC}\033[K" "$remaining"
 
     (( chunk_i++ ))
 done
@@ -998,8 +1012,12 @@ wait "$REC_PID" 2>/dev/null
 rm -f "$MIC_PIPE"
 MIC_PIPE=""
 
+# --- INPUT Ergebnis ---
+printf "\r  🎙 INPUT   $(draw_vu "$max_peak")\033[K"
+
 # ━━━ PEGEL-BEWERTUNG ━━━
 if (( max_peak < 300 )); then
+    echo ""
     echo -e "  ${RED}${BOLD}✗ KEIN SIGNAL${NC} – Mic empfängt nichts!"
     echo ""
 
@@ -1054,8 +1072,11 @@ else
     VERDICT="OK"
 fi
 
-# ━━━ PHASE 3: Wiedergabe (auf gleicher Zeile wie INPUT) ━━━
+# ━━━ PHASE 3: Wiedergabe (sequenziell) ━━━
 if [[ -s "$FILE" && -n "$VERDICT" ]]; then
+    # Cursor ist am Ende der INPUT-Zeile – zeige "Warte..." während Wiedergabe startet
+    printf "  ${DIM}Warte...${NC}"
+
     PLAY_PIPE=$(mktemp -u /tmp/playpipe.XXXXXX)
     mkfifo "$PLAY_PIPE"
 
@@ -1067,7 +1088,7 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
 
     exec 4<"$PLAY_PIPE"
 
-    # INPUT final peak anzeigen, OUTPUT live
+    playback_first=1
     while true; do
         chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&4 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
         peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
@@ -1077,25 +1098,36 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
             kill -0 "$PLAY_PID" 2>/dev/null || break
         fi
 
-        printf "\033[2A\r"
-        printf "  🎙 INPUT  $(draw_vu "$max_peak")  ${GREEN}✓${NC}       🔊 OUTPUT $(draw_vu "$peak")"
-        printf "\n\n"
+        if (( playback_first )); then
+            # INPUT finalisieren (Warte... → ✓), OUTPUT starten
+            printf "\r  🎙 INPUT   $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
+            printf "  🔊 OUTPUT $(draw_vu "$peak")\033[K"
+            playback_first=0
+        else
+            printf "\r  🔊 OUTPUT $(draw_vu "$peak")\033[K"
+        fi
     done
 
     exec 4<&-
     wait "$PLAY_PID" 2>/dev/null
     rm -f "$PLAY_PIPE"
     PLAY_PIPE=""
-fi
 
-# Finale Zeile mit beiden VU-Metern (statisch)
-printf "\033[2A\r"
-if [[ -n "$VERDICT" ]]; then
-    printf "  🎙 INPUT  $(draw_vu "$max_peak")  ${GREEN}✓${NC}       🔊 OUTPUT $(draw_vu "$max_peak")"
+    # Finale Anzeige
+    if (( playback_first )); then
+        # Wiedergabe hatte keine Frames
+        printf "\r  🎙 INPUT   $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
+        printf "  🔊 OUTPUT $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
+    else
+        printf "\r  🔊 OUTPUT $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
+    fi
 else
-    printf "  🎙 INPUT  $(draw_vu "$max_peak")           🔊 OUTPUT $(draw_vu 0)"
+    # Kein Playback, INPUT finalisieren
+    if [[ -n "$VERDICT" ]]; then
+        printf " ${GREEN}✓${NC}\033[K\n"
+    fi
 fi
-printf "\n\n"
+echo ""
 
 # ━━━ SNR + Frequenzgang (kompakt, eine Zeile) ━━━
 if [[ -n "$VERDICT" ]]; then
@@ -1119,15 +1151,15 @@ if [[ -n "$VERDICT" ]]; then
         snr_color="$GREEN"
         (( local_snr_int < 25 )) && snr_color="$YELLOW"
         (( local_snr_int < 15 )) && snr_color="$RED"
-        STATS_LINE+="  │  SNR: ${snr_color}${SNR_DB}dB${NC} ${DIM}(${SNR_RATING})${NC}"
+        STATS_LINE+=" │ SNR: ${snr_color}${SNR_DB}dB${NC} ${DIM}(${SNR_RATING})${NC}"
     fi
 
     # Frequenz
     if [[ -n "$FREQ_OK" ]]; then
         if [[ "$FREQ_OK" == "OK" ]]; then
-            STATS_LINE+="  │  Freq: ${GREEN}>4kHz ✓${NC}"
+            STATS_LINE+=" │ Freq: ${GREEN}>4kHz ✓${NC}"
         else
-            STATS_LINE+="  │  Freq: ${YELLOW}≤4kHz${NC}"
+            STATS_LINE+=" │ Freq: ${YELLOW}≤4kHz${NC}"
         fi
     fi
 
@@ -1136,20 +1168,19 @@ if [[ -n "$VERDICT" ]]; then
 fi
 
 # ━━━ ERGEBNIS ━━━
-case "$VERDICT" in
-    OK)
-        echo -e "  ═══════════════ ${BG_GREEN}${BOLD} ✅ BEREIT FÜR DEN ANRUF ${NC} ═══════════════"
-        ;;
-    WARN)
-        echo -e "  ═══════════════ ${YELLOW}${BOLD} ⚠  PEGEL ANPASSEN ${NC} ═══════════════════"
-        ;;
-esac
-
 # Ergebnis loggen
 if [[ -n "$VERDICT" ]]; then
     log_result
-    echo -e "  ${DIM}Gespeichert in ${LOG_FILE}${NC}"
 fi
+
+case "$VERDICT" in
+    OK)
+        echo -e "  ══ ${BG_GREEN}${BOLD} ✅ BEREIT FÜR DEN ANRUF ${NC} ${DIM}(log:${LOG_FILE})${NC} ══"
+        ;;
+    WARN)
+        echo -e "  ══ ${YELLOW}${BOLD} ⚠  PEGEL ANPASSEN ${NC} ${DIM}(log:${LOG_FILE})${NC} ══"
+        ;;
+esac
 
 echo ""
 tput cnorm
