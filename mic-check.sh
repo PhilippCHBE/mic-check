@@ -3,7 +3,7 @@
 #  PRE-CALL MIC CHECK
 #  mit USB / Bluetooth Auto-Erkennung
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION="1.4.0"
+VERSION="1.4.1"
 export LANG=C.UTF-8
 
 # --- CONFIG ---
@@ -30,11 +30,14 @@ Optionen:
   --list      Alle Audio-Geräte auflisten
 
 Was das Script macht:
-  1. Prüft Mikrofon- und Ausgabe-Gerät
-  2. Erkennt USB / Bluetooth Headsets
-  3. Schlägt Umschalten vor (USB > BT > Intern)
-  4. ${CHECK_SECS}-Sekunden Live-Pegeltest mit VU-Meter
-  5. Kurze Wiedergabe zur Kontrolle
+  1. Erkennt Audio-Server (PipeWire / PulseAudio)
+  2. Prüft Mikrofon- und Ausgabe-Gerät
+  3. Zeigt Bluetooth-Codec/Profil (mSBC, CVSD, SBC, AAC)
+  4. Erkennt USB / Bluetooth Headsets
+  5. Schlägt Umschalten vor (USB > BT > Intern)
+  6. Misst Rauschboden (Noise Floor)
+  7. ${CHECK_SECS}-Sekunden Live-Pegeltest mit VU-Meter
+  8. Kurze Wiedergabe zur Kontrolle
 
 Abhängigkeiten:  sox (sudo pacman -S sox)
 
@@ -82,6 +85,150 @@ DIM='\033[2m'
 NC='\033[0m'
 BG_RED='\033[41m'
 BG_GREEN='\033[42m'
+
+# ━━━ AUDIO-SERVER ERKENNUNG ━━━
+detect_audio_server() {
+    AUDIO_SERVER="unknown"
+    AUDIO_SERVER_VERSION=""
+
+    if command -v pipewire &>/dev/null && pgrep -x pipewire &>/dev/null; then
+        AUDIO_SERVER="pipewire"
+        AUDIO_SERVER_VERSION=$(pipewire --version 2>/dev/null | grep -oP 'pipewire\s+\K[0-9.]+' | head -1)
+        if pgrep -f pipewire-pulse &>/dev/null; then
+            AUDIO_SERVER="${AUDIO_SERVER}+pulse"
+        fi
+    elif command -v pulseaudio &>/dev/null && pgrep -x pulseaudio &>/dev/null; then
+        AUDIO_SERVER="pulseaudio"
+        AUDIO_SERVER_VERSION=$(pulseaudio --version 2>/dev/null | grep -oP '[0-9.]+' | head -1)
+    fi
+
+    # WirePlumber als Session-Manager?
+    if pgrep -x wireplumber &>/dev/null; then
+        SESSION_MANAGER="wireplumber"
+    else
+        SESSION_MANAGER=""
+    fi
+}
+
+# ━━━ BLUETOOTH CODEC/PROFIL ERKENNUNG ━━━
+detect_bt_codec() {
+    BT_CODEC=""
+    BT_PROFILE=""
+    BT_PROFILE_LABEL=""
+    BT_CODEC_WARNING=""
+    BT_ALL_PROFILES=()
+
+    # Kein BT-Gerät → nichts zu tun
+    [[ -z "$BT_SRC_ID" && -z "$BT_SINK_ID" ]] && return
+
+    # Finde den Bluetooth-Device-Namen für pactl
+    local bt_device_id="${BT_SRC_ID:-$BT_SINK_ID}"
+
+    # Aktives Profil über wpctl inspect ermitteln
+    local inspect_src="" inspect_sink=""
+    if [[ -n "$BT_SRC_ID" ]]; then
+        inspect_src=$(wpctl inspect "$BT_SRC_ID" 2>/dev/null)
+    fi
+    if [[ -n "$BT_SINK_ID" ]]; then
+        inspect_sink=$(wpctl inspect "$BT_SINK_ID" 2>/dev/null)
+    fi
+
+    # Codec aus der media.name / node.name / api.bluez5.codec Eigenschaft
+    local codec_line
+    codec_line=$(echo "$inspect_src" "$inspect_sink" | grep -i 'api.bluez5.codec' | head -1)
+    if [[ -n "$codec_line" ]]; then
+        BT_CODEC=$(echo "$codec_line" | sed 's/.*= *"\?\([^"]*\)"\?/\1/' | xargs)
+    fi
+
+    # Profil-Erkennung: pactl list cards für Bluetooth-Karte
+    local bt_card_info
+    bt_card_info=$(pactl list cards 2>/dev/null | awk '
+        /Name:.*bluez/{found=1}
+        found{print}
+        found && /^$/{found=0}
+    ')
+
+    if [[ -n "$bt_card_info" ]]; then
+        # Aktives Profil
+        BT_PROFILE=$(echo "$bt_card_info" | grep -A1 "Active Profile:" | head -1 | sed 's/.*Active Profile: *//')
+
+        # Alle verfügbaren Profile sammeln
+        local in_profiles=0
+        while IFS= read -r line; do
+            if echo "$line" | grep -q "Profiles:"; then
+                in_profiles=1
+                continue
+            fi
+            if (( in_profiles )); then
+                # Ende der Profile-Sektion
+                if echo "$line" | grep -qE "^[[:space:]]*(Active Profile|Ports):"; then
+                    break
+                fi
+                local pname
+                pname=$(echo "$line" | sed 's/^\s*//' | cut -d: -f1 | xargs)
+                [[ -n "$pname" && "$pname" != "off" ]] && BT_ALL_PROFILES+=("$pname")
+            fi
+        done <<< "$bt_card_info"
+    fi
+
+    # Profil-Label für Anzeige
+    case "$BT_PROFILE" in
+        *handsfree*head*unit*HFP*|*handsfree_head_unit*)
+            BT_PROFILE_LABEL="Handsfree (HFP)" ;;
+        *headset*head*unit*|*headset_head_unit*)
+            BT_PROFILE_LABEL="Headset (HSP/HFP)" ;;
+        *a2dp*sink*|*a2dp-sink*)
+            BT_PROFILE_LABEL="Headphones (A2DP)" ;;
+        *)
+            BT_PROFILE_LABEL="$BT_PROFILE" ;;
+    esac
+
+    # Codec-Label normalisieren
+    case "$BT_CODEC" in
+        msbc|mSBC|MSBC)   BT_CODEC="mSBC" ;;
+        cvsd|CVSD)         BT_CODEC="CVSD" ;;
+        sbc_xq|sbc-xq)    BT_CODEC="SBC-XQ" ;;
+        sbc|SBC)           BT_CODEC="SBC" ;;
+        aac|AAC)           BT_CODEC="AAC" ;;
+    esac
+
+    # Warnung wenn nicht optimaler Codec für Mikrofon
+    if [[ -n "$BT_CODEC" ]]; then
+        case "$BT_CODEC" in
+            mSBC)
+                BT_CODEC_WARNING="" ;;  # Bester Codec für Mikro
+            CVSD)
+                BT_CODEC_WARNING="CVSD hat niedrige Qualität (8kHz). mSBC wäre besser." ;;
+            SBC|SBC-XQ|AAC)
+                BT_CODEC_WARNING="A2DP-Codec – kein Mikrofon verfügbar! Wechsle zu Handsfree (mSBC)." ;;
+        esac
+    fi
+}
+
+# ━━━ RAUSCHBODEN-MESSUNG ━━━
+measure_noise_floor() {
+    local noise_file
+    noise_file=$(mktemp /tmp/micnoise.XXXXXX.raw)
+
+    # 1 Sekunde Stille aufnehmen
+    rec -q -c $CHANNELS -r $RATE -b $BITS -e signed-integer -t raw "$noise_file" \
+        trim 0 1 2>/dev/null
+
+    if [[ -s "$noise_file" ]]; then
+        NOISE_PEAK=$(od -An -td2 -v "$noise_file" | tr -s ' \n' '\n' | \
+            awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
+        if (( NOISE_PEAK > 0 )); then
+            NOISE_DB=$(awk "BEGIN{printf \"%.1f\", 20*log($NOISE_PEAK/32768)/log(10)}")
+        else
+            NOISE_DB="-inf"
+        fi
+    else
+        NOISE_PEAK=0
+        NOISE_DB="-inf"
+    fi
+
+    rm -f "$noise_file"
+}
 
 cleanup() {
     tput cnorm 2>/dev/null
@@ -144,7 +291,7 @@ line_type() {
     local line="$1"
     if echo "$line" | grep -qi "usb"; then
         echo "usb"
-    elif echo "$line" | grep -qi "bluez\|haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats"; then
+    elif echo "$line" | grep -qi "bluez\|haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats\|oneplus"; then
         echo "bluetooth"
     elif echo "$line" | grep -qi "arrow\|cavs\|realtek\|hdmi\|built-in\|alc\|intel"; then
         echo "internal"
@@ -230,7 +377,7 @@ detect_devices() {
     local bt_src_line=""
 
     # 1) Unter Sources: bekannte Headset-Namen
-    bt_src_line=$(echo "$sources_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats" | head -1)
+    bt_src_line=$(echo "$sources_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats\|oneplus" | head -1)
 
     # 2) Unter Sources: alles was nicht intern/USB
     if [[ -z "$bt_src_line" ]]; then
@@ -277,7 +424,7 @@ detect_devices() {
     BT_SINK_NAME=""
     BT_SINK_LINE=""
     local bt_sink_line
-    bt_sink_line=$(echo "$sinks_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats" | head -1)
+    bt_sink_line=$(echo "$sinks_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats\|oneplus" | head -1)
     if [[ -z "$bt_sink_line" ]]; then
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
@@ -372,6 +519,30 @@ echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 detect_devices
+detect_audio_server
+detect_bt_codec
+
+# Audio-Server Info
+AUDIO_SRV_LABEL=""
+case "$AUDIO_SERVER" in
+    pipewire+pulse)
+        AUDIO_SRV_LABEL="${GREEN}PipeWire${NC} ${DIM}(+ PulseAudio-Compat)${NC}" ;;
+    pipewire)
+        AUDIO_SRV_LABEL="${GREEN}PipeWire${NC}" ;;
+    pulseaudio)
+        AUDIO_SRV_LABEL="${YELLOW}PulseAudio${NC}" ;;
+    *)
+        AUDIO_SRV_LABEL="${RED}Unbekannt${NC}" ;;
+esac
+if [[ -n "$AUDIO_SERVER_VERSION" ]]; then
+    AUDIO_SRV_LABEL="${AUDIO_SRV_LABEL} ${DIM}v${AUDIO_SERVER_VERSION}${NC}"
+fi
+if [[ -n "$SESSION_MANAGER" ]]; then
+    AUDIO_SRV_LABEL="${AUDIO_SRV_LABEL} ${DIM}+ ${SESSION_MANAGER}${NC}"
+fi
+
+echo -e "  Audio:     ${AUDIO_SRV_LABEL}"
+echo ""
 
 # Mic-Info
 MIC_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)
@@ -422,6 +593,33 @@ if [[ -n "$USB_SRC_ID" || -n "$BT_SRC_ID" ]]; then
         active_mark=""
         [[ "$CURRENT_SRC_TYPE" == "bluetooth" ]] && active_mark=" ${CYAN}← aktiv${NC}"
         echo -e "    ${CYAN}●${NC} BT:   $(extract_display "$BT_SRC_LINE")${active_mark}"
+    fi
+    echo ""
+fi
+
+# Bluetooth Codec/Profil-Info
+if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]]; then
+    echo -e "  ${BOLD}Bluetooth-Profil:${NC}"
+    if [[ -n "$BT_PROFILE_LABEL" ]]; then
+        echo -e "    Profil:  ${CYAN}${BT_PROFILE_LABEL}${NC}"
+    fi
+    if [[ -n "$BT_CODEC" ]]; then
+        local codec_color="$GREEN"
+        [[ "$BT_CODEC" == "CVSD" ]] && codec_color="$RED"
+        [[ "$BT_CODEC" == "SBC" || "$BT_CODEC" == "SBC-XQ" || "$BT_CODEC" == "AAC" ]] && codec_color="$YELLOW"
+        echo -e "    Codec:   ${codec_color}${BT_CODEC}${NC}"
+    fi
+    if [[ ${#BT_ALL_PROFILES[@]} -gt 0 ]]; then
+        echo -e "    ${DIM}Verfügbare Profile:${NC}"
+        for p in "${BT_ALL_PROFILES[@]}"; do
+            local marker=""
+            [[ "$p" == "$BT_PROFILE" ]] && marker=" ${CYAN}← aktiv${NC}"
+            echo -e "      ${DIM}• ${p}${NC}${marker}"
+        done
+    fi
+    if [[ -n "$BT_CODEC_WARNING" ]]; then
+        echo ""
+        echo -e "    ${YELLOW}⚠ ${BT_CODEC_WARNING}${NC}"
     fi
     echo ""
 fi
@@ -495,6 +693,25 @@ if [[ -n "$MIC_MUTED" ]]; then
     tput cnorm
     exit 1
 fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHASE 1.5:  Rauschboden (Noise Floor)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo -e "  ${BOLD}🔇 Rauschboden-Messung${NC} – Bitte 1s still sein..."
+measure_noise_floor
+
+if [[ "$NOISE_DB" == "-inf" ]]; then
+    echo -e "  Noise Floor: ${GREEN}Kein Rauschen erkannt${NC}"
+elif (( NOISE_PEAK < 200 )); then
+    echo -e "  Noise Floor: ${GREEN}${NOISE_DB} dB${NC} ${DIM}(sehr gut)${NC}"
+elif (( NOISE_PEAK < 800 )); then
+    echo -e "  Noise Floor: ${YELLOW}${NOISE_DB} dB${NC} ${DIM}(akzeptabel)${NC}"
+else
+    echo -e "  Noise Floor: ${RED}${NOISE_DB} dB${NC} ${DIM}(zu hoch – Umgebung zu laut?)${NC}"
+fi
+echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  PHASE 2:  Live-Pegel

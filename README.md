@@ -8,25 +8,45 @@
 
 ## What it does
 
-1. **Detects audio devices** – USB, Bluetooth, and internal microphones/speakers
-2. **Smart routing** – suggests switching to the best available device (USB > BT > Internal)
-3. **Auto-fix mismatches** – if your mic is USB but output is internal, it corrects automatically
-4. **Live VU-meter** – 3-second recording with real-time peak level display
-5. **Playback test** – plays back your recording so you can hear yourself
-6. **Clear verdict** – ✅ Ready / ⚠ Adjust level / ❌ Problem
+1. **Detects audio server** – shows PipeWire or PulseAudio with version info
+2. **Detects audio devices** – USB, Bluetooth, and internal microphones/speakers
+3. **Shows Bluetooth codec/profile** – active codec (mSBC, CVSD, SBC, AAC), warns if suboptimal for mic use
+4. **Smart routing** – suggests switching to the best available device (USB > BT > Internal)
+5. **Auto-fix mismatches** – if your mic is USB but output is internal, it corrects automatically
+6. **Noise floor measurement** – 1-second silence test to check ambient noise level
+7. **Live VU-meter** – 3-second recording with real-time peak level display
+8. **Playback test** – plays back your recording so you can hear yourself
+9. **Clear verdict** – ✅ Ready / ⚠ Adjust level / ❌ Problem
 
 ## Screenshot
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  🎧 PRE-CALL MIC CHECK  v1.4.0
+  🎧 PRE-CALL MIC CHECK  v1.4.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Mikrofon:  147. USB Headset Mono [vol: 1.00]
-             ✓ 100%  via USB
+  Audio:     PipeWire (+ PulseAudio-Compat) v1.0.7 + wireplumber
 
-  Ausgabe:   148. USB Headset Stereo [vol: 0.75]
-             ✓ 75%  via USB
+  Mikrofon:  85. OnePlus Buds Pro 2 Handsfree [vol: 1.00]
+             ✓ 100%  via BT
+
+  Ausgabe:   84. OnePlus Buds Pro 2 Handsfree [vol: 0.60]
+             ✓ 60%  via BT
+
+  Bluetooth-Profil:
+    Profil:  Handsfree (HFP)
+    Codec:   mSBC
+    Verfügbare Profile:
+      • handsfree-headunit-msbc  ← aktiv
+      • handsfree-headunit-cvsd
+      • a2dp-sink-sbc-xq
+      • a2dp-sink-sbc
+      • a2dp-sink-aac
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  🔇 Rauschboden-Messung – Bitte 1s still sein...
+  Noise Floor: -52.3 dB (sehr gut)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -57,7 +77,7 @@ sudo pacman -S sox
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USER/mic-check.git
+git clone https://github.com/PhilippCHBE/mic-check.git
 cd mic-check
 
 # Make executable
@@ -103,11 +123,32 @@ source ~/.bashrc
 ## How it works
 
 ### Phase 1 – System Check
+- Detects audio server (PipeWire vs PulseAudio) and session manager
 - Reads device tree from `wpctl status`
 - Identifies default source (mic) and sink (output)
 - Detects USB and Bluetooth devices by name patterns
+- Shows Bluetooth codec/profile and warns about suboptimal choices
 - Shows volume levels and mute status
 - Offers to switch to better devices if available
+
+### Bluetooth Codecs
+
+For **microphone usage**, your BT headset must use a **Handsfree (HFP)** profile:
+
+| Codec  | Profile    | Mic? | Quality | Recommendation |
+|--------|------------|------|---------|----------------|
+| mSBC   | Handsfree  | ✅   | Good    | **Best for calls** – 16kHz wideband |
+| CVSD   | Handsfree  | ✅   | Low     | Fallback – 8kHz narrowband |
+| SBC-XQ | Headphones | ❌   | High    | Music only, no mic |
+| SBC    | Headphones | ❌   | Medium  | Music only, no mic |
+| AAC    | Headphones | ❌   | High    | Music only, no mic |
+
+The script detects which profile is active and warns if a Headphones (A2DP) profile is in use while testing the microphone.
+
+### Phase 1.5 – Noise Floor
+- Records 1 second of silence
+- Measures ambient noise level in dB
+- Rates: very good / acceptable / too high
 
 ### Phase 2 – Live Level Test
 - Records 3 seconds via `sox` (`rec`)
