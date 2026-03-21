@@ -3,7 +3,7 @@
 #  PRE-CALL MIC CHECK
 #  mit USB / Bluetooth Auto-Erkennung
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION="1.4.2"
+VERSION="1.4.3"
 export LANG=C.UTF-8
 
 # --- CONFIG ---
@@ -236,7 +236,29 @@ detect_bt_codec() {
     fi
 }
 
-# ━━━ AUTO-SWITCH BT → HANDSFREE mSBC ━━━
+# ━━━ AUTO-SWITCH BT → HANDSFREE mSBC (System-weit) ━━━
+# 3-Sekunden-Countdown mit [Leertaste] zum Abbrechen
+countdown_switch() {
+    local message="$1"
+    local seconds="${2:-3}"
+
+    tput cnorm
+    for (( i=seconds; i>0; i-- )); do
+        printf "\r    ${YELLOW}⏳ ${message} in ${BOLD}${i}s${NC}${YELLOW} – [Leertaste] zum Überspringen${NC}  "
+        # read mit 1s Timeout, einzelnes Zeichen
+        if read -r -s -n 1 -t 1 key 2>/dev/null; then
+            if [[ "$key" == "" || "$key" == " " ]]; then
+                printf "\r    ${DIM}↷ Übersprungen.${NC}%40s\n"
+                tput civis
+                return 1
+            fi
+        fi
+    done
+    printf "\r%80s\r"
+    tput civis
+    return 0
+}
+
 switch_bt_to_msbc() {
     # Nur wenn BT-Gerät vorhanden und nicht bereits auf mSBC
     [[ -z "$BT_SRC_ID" && -z "$BT_SINK_ID" ]] && return 1
@@ -247,49 +269,82 @@ switch_bt_to_msbc() {
     bt_card_name=$(pactl list cards short 2>/dev/null | grep -i 'bluez' | awk '{print $2}' | head -1)
     [[ -z "$bt_card_name" ]] && return 1
 
-    # Suche nach mSBC Handsfree-Profil in verfügbaren Profilen
-    local msbc_profile=""
+    # Profil-Auswahl: Bestes Handsfree-Profil finden
+    # Priorität: 1) headset-head-unit (ohne suffix = mSBC)
+    #            2) *msbc* Variante
+    #            3) irgendein headset/handsfree Profil (nicht -cvsd)
+    #            4) headset-head-unit-cvsd als letzter Fallback
+    local best_profile=""
+
+    # 1) Exakt "headset-head-unit" (ohne Suffix = mSBC auf den meisten Systemen)
     for p in "${BT_ALL_PROFILES[@]}"; do
-        if echo "$p" | grep -qi 'handsfree.*msbc\|hfp.*msbc\|headunit.*msbc'; then
-            msbc_profile="$p"
-            break
-        fi
+        [[ "$p" == "headset-head-unit" ]] && { best_profile="$p"; break; }
     done
 
-    # Fallback: irgendein Handsfree-Profil
-    if [[ -z "$msbc_profile" ]]; then
+    # 2) Explizites mSBC-Profil
+    if [[ -z "$best_profile" ]]; then
         for p in "${BT_ALL_PROFILES[@]}"; do
-            if echo "$p" | grep -qi 'handsfree\|hfp\|headunit'; then
-                msbc_profile="$p"
+            if echo "$p" | grep -qi 'msbc'; then
+                best_profile="$p"
                 break
             fi
         done
     fi
 
-    [[ -z "$msbc_profile" ]] && return 1
+    # 3) Handsfree/Headset (nicht CVSD)
+    if [[ -z "$best_profile" ]]; then
+        for p in "${BT_ALL_PROFILES[@]}"; do
+            if echo "$p" | grep -qi 'handsfree\|headset.*head.*unit\|hfp' && \
+               ! echo "$p" | grep -qi 'cvsd'; then
+                best_profile="$p"
+                break
+            fi
+        done
+    fi
 
-    echo -e "  ${YELLOW}⚠${NC}  BT-Profil ist ${BOLD}${BT_PROFILE_LABEL}${NC} (${BT_CODEC})"
-    echo -e "  ${DIM}Für Mikrofon-Nutzung wird Handsfree (mSBC) benötigt.${NC}"
+    # 4) Letzter Fallback: CVSD (besser als A2DP ohne Mic)
+    if [[ -z "$best_profile" ]]; then
+        for p in "${BT_ALL_PROFILES[@]}"; do
+            if echo "$p" | grep -qi 'handsfree\|headset.*head.*unit\|hfp\|cvsd'; then
+                best_profile="$p"
+                break
+            fi
+        done
+    fi
+
+    [[ -z "$best_profile" ]] && return 1
+    [[ "$best_profile" == "$BT_PROFILE" ]] && return 1
+
+    # Nachricht abhängig vom aktuellen Codec
+    local switch_msg=""
+    case "$BT_CODEC" in
+        CVSD)
+            echo -e "    ${YELLOW}⚠ CVSD hat niedrige Qualität (8kHz). mSBC wäre besser.${NC}"
+            switch_msg="Wechsle zu ${best_profile}"
+            ;;
+        SBC|SBC-XQ|AAC)
+            echo -e "    ${YELLOW}⚠ A2DP-Codec – kein Mikrofon verfügbar! Wechsle zu Handsfree (mSBC).${NC}"
+            switch_msg="Wechsle zu ${best_profile}"
+            ;;
+        *)
+            echo -e "    ${YELLOW}⚠ Profil nicht optimal für Mikrofon.${NC}"
+            switch_msg="Wechsle zu ${best_profile}"
+            ;;
+    esac
     echo ""
 
-    tput cnorm
-    read -r -p "    Automatisch auf ${msbc_profile} umschalten? [J/n] " answer
-    answer=${answer:-j}
-    tput civis
-
-    if [[ "$answer" =~ ^[jJyY]$ ]]; then
-        echo ""
-        echo -e "  ${DIM}Wechsle Profil → ${msbc_profile}...${NC}"
-        pactl set-card-profile "$bt_card_name" "$msbc_profile" 2>/dev/null
+    if countdown_switch "$switch_msg" 3; then
+        echo -e "    ${DIM}Setze BT-Profil system-weit → ${best_profile}...${NC}"
+        pactl set-card-profile "$bt_card_name" "$best_profile" 2>/dev/null
 
         if (( $? == 0 )); then
-            echo -e "  ${GREEN}✓${NC} Profil umgeschaltet auf ${BOLD}${msbc_profile}${NC}"
+            echo -e "    ${GREEN}✓${NC} Profil umgeschaltet auf ${BOLD}${best_profile}${NC} (system-weit)"
             sleep 1
             echo ""
-            echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
+            echo -e "    ${BOLD}↻ Starte Mic-Check neu...${NC}"
             do_restart
         else
-            echo -e "  ${RED}✗${NC} Profilwechsel fehlgeschlagen"
+            echo -e "    ${RED}✗${NC} Profilwechsel fehlgeschlagen"
             echo ""
         fi
     fi
@@ -700,7 +755,7 @@ KEEP_LABEL=""
 (( KEEP_DEVICES )) && KEEP_LABEL="  ${DIM}(--keep)${NC}"
 
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  🎧 PRE-CALL MIC CHECK${NC}${KEEP_LABEL}  ${DIM}v${VERSION}${NC}"
+echo -e "${BOLD}  🎧🎙 PRE-CALL MIC CHECK${NC}${KEEP_LABEL}  ${DIM}v${VERSION}${NC}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
@@ -803,7 +858,7 @@ if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]]; then
             echo -e "      ${DIM}• ${p}${NC}${marker}"
         done
     fi
-    if [[ -n "$BT_CODEC_WARNING" ]]; then
+    if [[ -n "$BT_CODEC_WARNING" && KEEP_DEVICES -eq 1 ]]; then
         echo ""
         echo -e "    ${YELLOW}⚠ ${BT_CODEC_WARNING}${NC}"
     fi
