@@ -1,0 +1,678 @@
+#!/bin/bash
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PRE-CALL MIC CHECK
+#  mit USB / Bluetooth Auto-Erkennung
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERSION="1.4.0"
+export LANG=C.UTF-8
+
+# --- CONFIG ---
+CHECK_SECS=3
+RATE=44100
+CHANNELS=1
+BITS=16
+BAR_W=35
+MAX_RESTARTS=2
+# --------------
+
+show_help() {
+    cat <<EOF
+mic-check v${VERSION} – Schneller Mikrofon-Test vor Anrufen
+
+Verwendung:  ./mic-check.sh [OPTIONEN]
+
+Optionen:
+  --help      Diese Hilfe anzeigen
+  --version   Versionsnummer anzeigen
+  --keep      Aktuelle Geräte beibehalten,
+              kein Umschalten vorschlagen
+  --debug     Debug-Infos zur Geräte-Erkennung
+  --list      Alle Audio-Geräte auflisten
+
+Was das Script macht:
+  1. Prüft Mikrofon- und Ausgabe-Gerät
+  2. Erkennt USB / Bluetooth Headsets
+  3. Schlägt Umschalten vor (USB > BT > Intern)
+  4. ${CHECK_SECS}-Sekunden Live-Pegeltest mit VU-Meter
+  5. Kurze Wiedergabe zur Kontrolle
+
+Abhängigkeiten:  sox (sudo pacman -S sox)
+
+Alias-Tipp:  echo 'alias miccheck="~/mic-check.sh"' >> ~/.bashrc
+EOF
+    exit 0
+}
+
+show_list() {
+    echo "mic-check v${VERSION} – Geräte-Übersicht"
+    echo ""
+    wpctl status 2>/dev/null | awk '
+        /Audio/,/Video/ { print }
+    ' | head -40
+    exit 0
+}
+
+# --- OPTIONEN ---
+KEEP_DEVICES=0
+DEBUG=0
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)    show_help ;;
+        --version|-v) echo "mic-check v${VERSION}"; exit 0 ;;
+        --keep)       KEEP_DEVICES=1 ;;
+        --debug)      DEBUG=1 ;;
+        --list)       show_list ;;
+    esac
+done
+
+BYTES_PER_SEC=$(( RATE * CHANNELS * (BITS / 8) ))
+CHUNK_BYTES=$(( BYTES_PER_SEC / 5 ))
+CHUNK_COUNT=$(( CHECK_SECS * 5 ))
+FILE=$(mktemp /tmp/miccheck.XXXXXX.raw)
+
+RESTART_COUNT="${_MICCHECK_RESTARTS:-0}"
+
+# --- Farben ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+BG_RED='\033[41m'
+BG_GREEN='\033[42m'
+
+cleanup() {
+    tput cnorm 2>/dev/null
+    rm -f "$FILE" 2>/dev/null
+    [[ -n "$PLAY_PIPE" ]] && rm -f "$PLAY_PIPE" 2>/dev/null
+    [[ -n "$MIC_PIPE" ]]  && rm -f "$MIC_PIPE"  2>/dev/null
+}
+trap cleanup EXIT
+
+# ━━━ VU-BALKEN ━━━
+draw_vu() {
+    local peak="$1"
+    local level=$(( peak * BAR_W / 32768 ))
+    (( level > BAR_W )) && level=$BAR_W
+
+    local db
+    if (( peak > 0 )); then
+        db=$(awk "BEGIN{printf \"%6.1f\", 20*log($peak/32768)/log(10)}")
+    else
+        db="  -inf"
+    fi
+
+    local color="$GREEN"
+    (( level > BAR_W * 70 / 100 )) && color="$RED"
+    (( level > BAR_W * 45 / 100 && level <= BAR_W * 70 / 100 )) && color="$YELLOW"
+
+    local bar="" empty=""
+    (( level > 0 )) && bar=$(printf '█%.0s' $(seq 1 "$level"))
+    local rest=$(( BAR_W - level ))
+    (( rest > 0 )) && empty=$(printf '░%.0s' $(seq 1 "$rest"))
+
+    printf "[${color}%s${NC}%s] %s dB" "$bar" "$empty" "$db"
+}
+
+# ━━━ ROBUSTE PARSER ━━━
+
+# Holt die erste Zahl die direkt vor einem Punkt steht
+# "│  *  147. USB Composite Device Mono [vol: 1.00]" → "147"
+extract_id() {
+    echo "$1" | grep -oE '[0-9]+\.' | head -1 | tr -d '.'
+}
+
+# Gibt die ganze Zeile ab "ID. Name" zurück (Tree-Zeichen + Sterne weg)
+# "│  *  147. USB Composite Device Mono [vol: 1.00]" → "147. USB Composite Device Mono [vol: 1.00]"
+extract_display() {
+    echo "$1" | sed 's/^[^0-9]*//'
+}
+
+# Nur der Name (ohne ID und ohne [...])
+# "│  *  147. USB Composite Device Mono [vol: 1.00]" → "USB Composite Device Mono"
+extract_name() {
+    local display
+    display=$(extract_display "$1")
+    # Entferne "123. " am Anfang, dann alles ab "["
+    echo "$display" | sed 's/^[0-9]*\.\s*//' | sed 's/\[.*//' | xargs
+}
+
+# Bestimmt Verbindungstyp anhand des Zeileninhalts
+line_type() {
+    local line="$1"
+    if echo "$line" | grep -qi "usb"; then
+        echo "usb"
+    elif echo "$line" | grep -qi "bluez\|haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats"; then
+        echo "bluetooth"
+    elif echo "$line" | grep -qi "arrow\|cavs\|realtek\|hdmi\|built-in\|alc\|intel"; then
+        echo "internal"
+    else
+        echo "unknown"
+    fi
+}
+
+# ━━━ GERÄTE-ERKENNUNG ━━━
+detect_devices() {
+    local wpctl_raw
+    wpctl_raw=$(wpctl status 2>/dev/null)
+
+    # --- Sektionen via Zeilennummern ---
+    local sinks_ln sources_ln filters_ln streams_ln total_ln
+
+    sinks_ln=$(echo "$wpctl_raw" | grep -n "Sinks:" | head -1 | cut -d: -f1)
+    sources_ln=$(echo "$wpctl_raw" | grep -n "Sources:" | head -1 | cut -d: -f1)
+    filters_ln=$(echo "$wpctl_raw" | grep -n "Filters:" | head -1 | cut -d: -f1)
+    streams_ln=$(echo "$wpctl_raw" | grep -n "Streams:" | head -1 | cut -d: -f1)
+    total_ln=$(echo "$wpctl_raw" | wc -l)
+
+    local sinks_block="" sources_block="" filters_block=""
+
+    if [[ -n "$sinks_ln" && -n "$sources_ln" ]] && (( sources_ln > sinks_ln + 1 )); then
+        sinks_block=$(echo "$wpctl_raw" | sed -n "$((sinks_ln + 1)),$((sources_ln - 1))p")
+    fi
+
+    if [[ -n "$sources_ln" && -n "$filters_ln" ]] && (( filters_ln > sources_ln + 1 )); then
+        sources_block=$(echo "$wpctl_raw" | sed -n "$((sources_ln + 1)),$((filters_ln - 1))p")
+    fi
+
+    local filters_end=$(( ${streams_ln:-$total_ln} - 1 ))
+    if [[ -n "$filters_ln" ]] && (( filters_end > filters_ln )); then
+        filters_block=$(echo "$wpctl_raw" | sed -n "$((filters_ln + 1)),${filters_end}p")
+    fi
+
+    # Nur Zeilen mit Node-IDs (haben "Zahl." Muster gefolgt von Buchstaben)
+    sinks_block=$(echo "$sinks_block" | grep -E '[0-9]+\.\s+[A-Za-z]')
+    sources_block=$(echo "$sources_block" | grep -E '[0-9]+\.\s+[A-Za-z]')
+    filters_block=$(echo "$filters_block" | grep -E '[0-9]+\.')
+
+    # --- Debug ---
+    if (( DEBUG )); then
+        echo -e "  ${DIM}[DEBUG] Sinks (ab Zeile $sinks_ln):${NC}"
+        echo "$sinks_block" | sed 's/^/    /'
+        echo -e "  ${DIM}[DEBUG] Sources (ab Zeile $sources_ln):${NC}"
+        echo "$sources_block" | sed 's/^/    /'
+        echo -e "  ${DIM}[DEBUG] Filters (ab Zeile $filters_ln):${NC}"
+        echo "$filters_block" | sed 's/^/    /'
+        echo ""
+    fi
+
+    # --- Default Source ---
+    DEFAULT_SRC_LINE=$(echo "$sources_block" | grep '[*]' | head -1)
+    if [[ -z "$DEFAULT_SRC_LINE" ]]; then
+        DEFAULT_SRC_LINE=$(echo "$filters_block" | grep '[*]' | head -1)
+    fi
+    CURRENT_SRC_ID=$(extract_id "$DEFAULT_SRC_LINE")
+    CURRENT_SRC_TYPE=$(line_type "$DEFAULT_SRC_LINE")
+
+    # --- Default Sink ---
+    DEFAULT_SINK_LINE=$(echo "$sinks_block" | grep '[*]' | head -1)
+    CURRENT_SINK_ID=$(extract_id "$DEFAULT_SINK_LINE")
+    CURRENT_SINK_TYPE=$(line_type "$DEFAULT_SINK_LINE")
+
+    # --- USB Source ---
+    USB_SRC_ID=""
+    USB_SRC_NAME=""
+    USB_SRC_LINE=""
+    local usb_src_line
+    usb_src_line=$(echo "$sources_block" | grep -i "usb" | head -1)
+    if [[ -n "$usb_src_line" ]]; then
+        USB_SRC_ID=$(extract_id "$usb_src_line")
+        USB_SRC_NAME=$(extract_name "$usb_src_line")
+        USB_SRC_LINE="$usb_src_line"
+    fi
+
+    # --- Bluetooth Source ---
+    BT_SRC_ID=""
+    BT_SRC_NAME=""
+    BT_SRC_LINE=""
+    local bt_src_line=""
+
+    # 1) Unter Sources: bekannte Headset-Namen
+    bt_src_line=$(echo "$sources_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats" | head -1)
+
+    # 2) Unter Sources: alles was nicht intern/USB
+    if [[ -z "$bt_src_line" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local lt
+            lt=$(line_type "$line")
+            [[ "$lt" == "internal" || "$lt" == "usb" ]] && continue
+            bt_src_line="$line"
+            break
+        done <<< "$sources_block"
+    fi
+
+    # 3) Unter Filters: bluez_input (NICHT bluez_capture_internal!)
+    if [[ -z "$bt_src_line" ]]; then
+        bt_src_line=$(echo "$filters_block" | grep -i 'bluez_input\.' | grep -vi 'capture_internal' | head -1)
+    fi
+
+    if [[ -n "$bt_src_line" ]]; then
+        BT_SRC_ID=$(extract_id "$bt_src_line")
+        BT_SRC_NAME=$(extract_name "$bt_src_line")
+        BT_SRC_LINE="$bt_src_line"
+    fi
+
+    # --- USB Sink ---
+    # Bevorzuge Analog Stereo über Digital Stereo (IEC958/S/PDIF)
+    USB_SINK_ID=""
+    USB_SINK_NAME=""
+    USB_SINK_LINE=""
+
+    local usb_sink_analog usb_sink_any
+    usb_sink_analog=$(echo "$sinks_block" | grep -i "usb" | grep -vi "iec958\|digital\|spdif\|s/pdif" | head -1)
+    usb_sink_any=$(echo "$sinks_block" | grep -i "usb" | head -1)
+
+    local usb_sink_line="${usb_sink_analog:-$usb_sink_any}"
+    if [[ -n "$usb_sink_line" ]]; then
+        USB_SINK_ID=$(extract_id "$usb_sink_line")
+        USB_SINK_NAME=$(extract_name "$usb_sink_line")
+        USB_SINK_LINE="$usb_sink_line"
+    fi
+
+    # --- Bluetooth Sink ---
+    BT_SINK_ID=""
+    BT_SINK_NAME=""
+    BT_SINK_LINE=""
+    local bt_sink_line
+    bt_sink_line=$(echo "$sinks_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats" | head -1)
+    if [[ -z "$bt_sink_line" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local lt
+            lt=$(line_type "$line")
+            [[ "$lt" == "internal" || "$lt" == "usb" ]] && continue
+            bt_sink_line="$line"
+            break
+        done <<< "$sinks_block"
+    fi
+    if [[ -n "$bt_sink_line" ]]; then
+        BT_SINK_ID=$(extract_id "$bt_sink_line")
+        BT_SINK_NAME=$(extract_name "$bt_sink_line")
+        BT_SINK_LINE="$bt_sink_line"
+    fi
+
+    # --- Debug ---
+    if (( DEBUG )); then
+        echo -e "  ${DIM}[DEBUG] Default Src:  ID=${CURRENT_SRC_ID} Type=${CURRENT_SRC_TYPE}${NC}"
+        echo -e "  ${DIM}[DEBUG] Default Sink: ID=${CURRENT_SINK_ID} Type=${CURRENT_SINK_TYPE}${NC}"
+        echo -e "  ${DIM}[DEBUG] USB Src:  ${USB_SRC_ID} = ${USB_SRC_NAME}${NC}"
+        echo -e "  ${DIM}[DEBUG] BT Src:   ${BT_SRC_ID} = ${BT_SRC_NAME}${NC}"
+        echo -e "  ${DIM}[DEBUG] USB Sink: ${USB_SINK_ID} = ${USB_SINK_NAME}${NC}"
+        echo -e "  ${DIM}[DEBUG] BT Sink:  ${BT_SINK_ID} = ${BT_SINK_NAME}${NC}"
+        echo ""
+    fi
+}
+
+connection_label() {
+    case "$1" in
+        usb)       echo -e "${GREEN}USB${NC}" ;;
+        bluetooth) echo -e "${CYAN}BT${NC}" ;;
+        internal)  echo -e "${DIM}Intern${NC}" ;;
+        *)         echo -e "${DIM}?${NC}" ;;
+    esac
+}
+
+do_restart() {
+    sleep 1
+    cleanup
+    export _MICCHECK_RESTARTS=$(( RESTART_COUNT + 1 ))
+    exec "$0" "$@"
+}
+
+switch_to_device() {
+    local src_id="$1" src_name="$2" sink_id="$3" sink_name="$4"
+
+    echo -e "  ${DIM}Setze Mikrofon  → ${src_name} (${src_id})${NC}"
+    wpctl set-default "$src_id" 2>/dev/null
+
+    if [[ -n "$sink_id" ]]; then
+        echo -e "  ${DIM}Setze Ausgabe   → ${sink_name} (${sink_id})${NC}"
+        wpctl set-default "$sink_id" 2>/dev/null
+    fi
+
+    sleep 0.5
+    echo -e "  ${GREEN}✓${NC} Umgeschaltet"
+    echo ""
+    echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
+    do_restart
+}
+
+# ━━━ ABHÄNGIGKEITEN ━━━
+if ! command -v sox &>/dev/null; then
+    echo -e "${RED}Fehler: 'sox' fehlt!${NC}  → sudo pacman -S sox"
+    exit 1
+fi
+
+# ━━━ Endlosschleifen-Schutz ━━━
+if (( RESTART_COUNT >= MAX_RESTARTS )); then
+    clear
+    echo -e "${RED}${BOLD}Abbruch: Umschalten nach ${MAX_RESTARTS} Versuchen fehlgeschlagen.${NC}"
+    echo ""
+    echo -e "  ${DIM}Debug: ./mic-check.sh --debug${NC}"
+    echo ""
+    tput cnorm
+    exit 1
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHASE 1:  System-Check
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+clear
+tput civis
+
+KEEP_LABEL=""
+(( KEEP_DEVICES )) && KEEP_LABEL="  ${DIM}(--keep)${NC}"
+
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}  🎧 PRE-CALL MIC CHECK${NC}${KEEP_LABEL}  ${DIM}v${VERSION}${NC}"
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
+detect_devices
+
+# Mic-Info
+MIC_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)
+MIC_PCT=$(echo "$MIC_VOL" | awk '{printf "%.0f", $2*100}')
+MIC_MUTED=$(echo "$MIC_VOL" | grep -o "MUTED")
+
+# Ausgabe-Info
+OUT_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
+OUT_PCT=$(echo "$OUT_VOL" | awk '{printf "%.0f", $2*100}')
+OUT_MUTED=$(echo "$OUT_VOL" | grep -o "MUTED")
+
+# Status-Icons
+if [[ -n "$MIC_MUTED" ]]; then
+    MIC_STATUS="${BG_RED}${BOLD} ✗ STUMM ${NC}"
+elif (( MIC_PCT < 20 )); then
+    MIC_STATUS="${YELLOW}⚠ Leise (${MIC_PCT}%)${NC}"
+else
+    MIC_STATUS="${GREEN}✓ ${MIC_PCT}%${NC}"
+fi
+
+if [[ -n "$OUT_MUTED" ]]; then
+    OUT_STATUS="${BG_RED}${BOLD} ✗ STUMM ${NC}"
+elif (( OUT_PCT < 20 )); then
+    OUT_STATUS="${YELLOW}⚠ Leise (${OUT_PCT}%)${NC}"
+else
+    OUT_STATUS="${GREEN}✓ ${OUT_PCT}%${NC}"
+fi
+
+SRC_LABEL=$(connection_label "$CURRENT_SRC_TYPE")
+SINK_LABEL=$(connection_label "$CURRENT_SINK_TYPE")
+
+echo -e "  Mikrofon:  ${DIM}$(extract_display "$DEFAULT_SRC_LINE")${NC}"
+echo -e "             ${MIC_STATUS}  via ${SRC_LABEL}"
+echo ""
+echo -e "  Ausgabe:   ${DIM}$(extract_display "$DEFAULT_SINK_LINE")${NC}"
+echo -e "             ${OUT_STATUS}  via ${SINK_LABEL}"
+echo ""
+
+# Verfügbare externe Quellen
+if [[ -n "$USB_SRC_ID" || -n "$BT_SRC_ID" ]]; then
+    echo -e "  ${DIM}Verfügbar:${NC}"
+    if [[ -n "$USB_SRC_ID" ]]; then
+        active_mark=""
+        [[ "$CURRENT_SRC_TYPE" == "usb" ]] && active_mark=" ${GREEN}← aktiv${NC}"
+        echo -e "    ${GREEN}●${NC} USB:  $(extract_display "$USB_SRC_LINE")${active_mark}"
+    fi
+    if [[ -n "$BT_SRC_ID" ]]; then
+        active_mark=""
+        [[ "$CURRENT_SRC_TYPE" == "bluetooth" ]] && active_mark=" ${CYAN}← aktiv${NC}"
+        echo -e "    ${CYAN}●${NC} BT:   $(extract_display "$BT_SRC_LINE")${active_mark}"
+    fi
+    echo ""
+fi
+
+# ━━━ SMART ROUTING (nur ohne --keep) ━━━
+if (( KEEP_DEVICES == 0 )); then
+    tput cnorm
+
+    # Auto-Fix: Mic=USB aber Ausgabe≠USB
+    if [[ "$CURRENT_SRC_TYPE" == "usb" && "$CURRENT_SINK_TYPE" != "usb" && -n "$USB_SINK_ID" ]]; then
+        echo -e "  ${YELLOW}⚠${NC}  Mikrofon ist USB, aber Ausgabe ist $(connection_label "$CURRENT_SINK_TYPE")"
+        echo -e "  ${DIM}Korrigiere Ausgabe auf USB...${NC}"
+        echo -e "  ${DIM}→ $(extract_display "$USB_SINK_LINE")${NC}"
+        wpctl set-default "$USB_SINK_ID" 2>/dev/null
+        echo -e "  ${GREEN}✓${NC} Ausgabe umgeschaltet"
+        echo ""
+        echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
+        do_restart
+    fi
+
+    # Auto-Fix: Mic=BT aber Ausgabe≠BT
+    if [[ "$CURRENT_SRC_TYPE" == "bluetooth" && "$CURRENT_SINK_TYPE" != "bluetooth" && -n "$BT_SINK_ID" ]]; then
+        echo -e "  ${YELLOW}⚠${NC}  Mikrofon ist BT, aber Ausgabe ist $(connection_label "$CURRENT_SINK_TYPE")"
+        echo -e "  ${DIM}Korrigiere Ausgabe auf BT...${NC}"
+        echo -e "  ${DIM}→ $(extract_display "$BT_SINK_LINE")${NC}"
+        wpctl set-default "$BT_SINK_ID" 2>/dev/null
+        echo -e "  ${GREEN}✓${NC} Ausgabe umgeschaltet"
+        echo ""
+        echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
+        do_restart
+    fi
+
+    # Vorschlag: USB verfügbar und nicht aktiv
+    if [[ "$CURRENT_SRC_TYPE" != "usb" && -n "$USB_SRC_ID" ]]; then
+        echo -e "  ${GREEN}●${NC} USB-Headset erkannt: ${BOLD}${USB_SRC_NAME}${NC}"
+        echo -e "    ${DIM}Aktuell: $(connection_label "$CURRENT_SRC_TYPE")${NC}"
+        echo ""
+        read -r -p "    Auf USB umschalten (Mic + Ausgabe)? [J/n] " answer
+        answer=${answer:-j}
+        if [[ "$answer" =~ ^[jJyY]$ ]]; then
+            echo ""
+            switch_to_device "$USB_SRC_ID" "$USB_SRC_NAME" "$USB_SINK_ID" "$USB_SINK_NAME"
+        fi
+        echo ""
+    fi
+
+    # Vorschlag: Mic=Intern, kein USB, BT verfügbar
+    if [[ "$CURRENT_SRC_TYPE" == "internal" && -z "$USB_SRC_ID" && -n "$BT_SRC_ID" ]]; then
+        echo -e "  ${CYAN}●${NC} Bluetooth-Headset erkannt: ${BOLD}${BT_SRC_NAME}${NC}"
+        echo -e "    ${DIM}Aktuell wird das interne Mikrofon verwendet.${NC}"
+        echo ""
+        read -r -p "    Auf Bluetooth umschalten (Mic + Ausgabe)? [J/n] " answer
+        answer=${answer:-j}
+        if [[ "$answer" =~ ^[jJyY]$ ]]; then
+            echo ""
+            switch_to_device "$BT_SRC_ID" "$BT_SRC_NAME" "$BT_SINK_ID" "$BT_SINK_NAME"
+        fi
+        echo ""
+    fi
+
+    tput civis
+fi
+
+# Bei MUTE abbrechen
+if [[ -n "$MIC_MUTED" ]]; then
+    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "  ${RED}${BOLD}Mikrofon ist stumm!${NC}"
+    echo -e "  ${DIM}Entstummen:${NC} wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0"
+    echo ""
+    tput cnorm
+    exit 1
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHASE 2:  Live-Pegel
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo -e "  ${BOLD}🎙  Pegeltest${NC} – Sprich ${CHECK_SECS}s lang..."
+echo ""
+echo -e "  INPUT  $(draw_vu 0)"
+echo ""
+
+MIC_PIPE=$(mktemp -u /tmp/micpipe.XXXXXX)
+mkfifo "$MIC_PIPE"
+
+rec -q -c $CHANNELS -r $RATE -b $BITS -e signed-integer -t raw - \
+    trim 0 $CHECK_SECS 2>/dev/null \
+    | tee "$FILE" > "$MIC_PIPE" &
+REC_PID=$!
+
+exec 3<"$MIC_PIPE"
+
+max_peak=0
+chunk_i=0
+
+while (( chunk_i < CHUNK_COUNT )); do
+    chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&3 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
+
+    peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
+    [[ -z "$peak" ]] && peak=0
+    (( peak > max_peak )) && max_peak=$peak
+
+    remaining=$(( CHECK_SECS - chunk_i / 5 ))
+
+    printf "\033[2A\r"
+    printf "  INPUT  $(draw_vu "$peak")  ${DIM}%ds${NC}  " "$remaining"
+    printf "\n\n"
+
+    (( chunk_i++ ))
+done
+
+exec 3<&-
+wait "$REC_PID" 2>/dev/null
+rm -f "$MIC_PIPE"
+MIC_PIPE=""
+
+# ━━━ PEGEL-BEWERTUNG ━━━
+echo ""
+
+if (( max_peak < 300 )); then
+    echo -e "  ${RED}${BOLD}✗ KEIN SIGNAL${NC} – Mic empfängt nichts!"
+    echo ""
+
+    if (( KEEP_DEVICES == 1 )); then
+        echo -e "  ${DIM}(--keep aktiv, kein Gerätewechsel)${NC}"
+        echo ""
+        echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo -e "  ${BG_RED}${BOLD} ✗ MIKROFON PROBLEM – NICHT ANRUFEN ${NC}"
+        echo ""
+        tput cnorm
+        exit 1
+    fi
+
+    tput cnorm
+    SWITCHED=0
+
+    if [[ -n "$USB_SRC_ID" && "$CURRENT_SRC_TYPE" != "usb" ]]; then
+        echo -e "  ${GREEN}●${NC} USB-Gerät verfügbar: ${BOLD}${USB_SRC_NAME}${NC}"
+        echo ""
+        read -r -p "    Auf USB umschalten? [J/n] " answer
+        answer=${answer:-j}
+        if [[ "$answer" =~ ^[jJyY]$ ]]; then
+            echo ""
+            switch_to_device "$USB_SRC_ID" "$USB_SRC_NAME" "$USB_SINK_ID" "$USB_SINK_NAME"
+            SWITCHED=1
+        fi
+    fi
+
+    if (( SWITCHED == 0 )) && [[ -n "$BT_SRC_ID" && "$CURRENT_SRC_TYPE" != "bluetooth" ]]; then
+        echo -e "  ${CYAN}●${NC} Bluetooth verfügbar: ${BOLD}${BT_SRC_NAME}${NC}"
+        echo ""
+        read -r -p "    Auf Bluetooth umschalten? [J/n] " answer
+        answer=${answer:-j}
+        if [[ "$answer" =~ ^[jJyY]$ ]]; then
+            echo ""
+            switch_to_device "$BT_SRC_ID" "$BT_SRC_NAME" "$BT_SINK_ID" "$BT_SINK_NAME"
+            SWITCHED=1
+        fi
+    fi
+
+    if (( SWITCHED == 0 )); then
+        echo ""
+        echo -e "  ${DIM}Tipps:${NC}"
+        echo -e "  ${DIM}  → Kabel/Adapter prüfen${NC}"
+        echo -e "  ${DIM}  → Physischen Mute-Schalter prüfen${NC}"
+        echo -e "  ${DIM}  → ./mic-check.sh --debug${NC}"
+        echo ""
+        echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo -e "  ${BG_RED}${BOLD} ✗ MIKROFON PROBLEM – NICHT ANRUFEN ${NC}"
+        echo ""
+        tput cnorm
+        exit 1
+    fi
+
+elif (( max_peak < 2000 )); then
+    echo -e "  ${YELLOW}⚠ SEHR LEISE${NC} – Pegel zu niedrig für Anrufe"
+    echo -e "  ${DIM}  → wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 100%${NC}"
+    VERDICT="WARN"
+elif (( max_peak > 30000 )); then
+    echo -e "  ${YELLOW}⚠ ZU LAUT / CLIPPING${NC} – Pegel reduzieren"
+    echo -e "  ${DIM}  → wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 70%${NC}"
+    VERDICT="WARN"
+else
+    echo -e "  ${GREEN}${BOLD}✓ PEGEL OK${NC}"
+    VERDICT="OK"
+fi
+
+echo ""
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHASE 3:  Kurze Wiedergabe
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if [[ -s "$FILE" && -n "$VERDICT" ]]; then
+    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "  ${BOLD}🔊 Wiedergabe${NC} – So klingst du:"
+    echo ""
+    echo -e "  OUTPUT $(draw_vu 0)"
+    echo ""
+
+    PLAY_PIPE=$(mktemp -u /tmp/playpipe.XXXXXX)
+    mkfifo "$PLAY_PIPE"
+
+    sox -q -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer "$FILE" \
+        -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer - 2>/dev/null \
+        | tee >(sox -q -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer - \
+                -d 2>/dev/null) > "$PLAY_PIPE" &
+    PLAY_PID=$!
+
+    exec 4<"$PLAY_PIPE"
+
+    while true; do
+        chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&4 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
+        peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
+        [[ -z "$peak" ]] && peak=0
+
+        if (( peak == 0 )); then
+            kill -0 "$PLAY_PID" 2>/dev/null || break
+        fi
+
+        printf "\033[2A\r"
+        printf "  OUTPUT $(draw_vu "$peak")     "
+        printf "\n\n"
+    done
+
+    exec 4<&-
+    wait "$PLAY_PID" 2>/dev/null
+    rm -f "$PLAY_PIPE"
+    PLAY_PIPE=""
+
+    echo ""
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ERGEBNIS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+case "$VERDICT" in
+    OK)
+        echo -e "  ${BG_GREEN}${BOLD} ✓ BEREIT FÜR DEN ANRUF ${NC}"
+        ;;
+    WARN)
+        echo -e "  ${YELLOW}${BOLD}⚠  FUNKTIONIERT, ABER PEGEL ANPASSEN${NC}"
+        ;;
+esac
+
+echo ""
+tput cnorm
