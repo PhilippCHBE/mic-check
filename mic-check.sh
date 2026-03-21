@@ -3,7 +3,7 @@
 #  PRE-CALL MIC CHECK
 #  mit USB / Bluetooth Auto-Erkennung
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION="1.4.1"
+VERSION="1.4.2"
 export LANG=C.UTF-8
 
 # --- CONFIG ---
@@ -13,6 +13,7 @@ CHANNELS=1
 BITS=16
 BAR_W=35
 MAX_RESTARTS=2
+LOG_FILE="${HOME}/.mic-check.log"
 # --------------
 
 show_help() {
@@ -28,16 +29,21 @@ Optionen:
               kein Umschalten vorschlagen
   --debug     Debug-Infos zur Geräte-Erkennung
   --list      Alle Audio-Geräte auflisten
+  --history   Letzte Test-Ergebnisse anzeigen
 
 Was das Script macht:
   1. Erkennt Audio-Server (PipeWire / PulseAudio)
   2. Prüft Mikrofon- und Ausgabe-Gerät
   3. Zeigt Bluetooth-Codec/Profil (mSBC, CVSD, SBC, AAC)
-  4. Erkennt USB / Bluetooth Headsets
-  5. Schlägt Umschalten vor (USB > BT > Intern)
-  6. Misst Rauschboden (Noise Floor)
-  7. ${CHECK_SECS}-Sekunden Live-Pegeltest mit VU-Meter
-  8. Kurze Wiedergabe zur Kontrolle
+  4. Wechselt BT automatisch auf Handsfree mSBC
+  5. Erkennt USB / Bluetooth Headsets
+  6. Schlägt Umschalten vor (USB > BT > Intern)
+  7. Misst Rauschboden (Noise Floor)
+  8. ${CHECK_SECS}-Sekunden Live-Pegeltest mit VU-Meter
+  9. Frequenzgang-Prüfung (4kHz-Cutoff-Erkennung)
+ 10. Berechnet Signal-Rausch-Abstand (SNR)
+ 11. Kurze Wiedergabe zur Kontrolle
+ 12. Speichert Ergebnisse in ${LOG_FILE}
 
 Abhängigkeiten:  sox (sudo pacman -S sox)
 
@@ -55,6 +61,30 @@ show_list() {
     exit 0
 }
 
+show_history() {
+    echo "mic-check v${VERSION} – Test-Verlauf"
+    echo ""
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "  Noch keine Tests gespeichert."
+        echo "  Log-Datei: ${LOG_FILE}"
+    else
+        echo "  Letzte 20 Ergebnisse (${LOG_FILE}):"
+        echo ""
+        tail -20 "$LOG_FILE" | while IFS='|' read -r ts verdict device codec snr_val noise_val peak_val freq_ok; do
+            local icon="?"
+            case "$verdict" in
+                OK)   icon="✓" ;;
+                WARN) icon="⚠" ;;
+                FAIL) icon="✗" ;;
+            esac
+            printf "  %s  %s  %-6s  %-25s  Codec:%-5s  SNR:%s  Noise:%s  Peak:%s  Freq:%s\n" \
+                "$ts" "$icon" "$verdict" "$device" "$codec" "$snr_val" "$noise_val" "$peak_val" "$freq_ok"
+        done
+    fi
+    echo ""
+    exit 0
+}
+
 # --- OPTIONEN ---
 KEEP_DEVICES=0
 DEBUG=0
@@ -65,6 +95,7 @@ for arg in "$@"; do
         --keep)       KEEP_DEVICES=1 ;;
         --debug)      DEBUG=1 ;;
         --list)       show_list ;;
+        --history)    show_history ;;
     esac
 done
 
@@ -203,6 +234,161 @@ detect_bt_codec() {
                 BT_CODEC_WARNING="A2DP-Codec – kein Mikrofon verfügbar! Wechsle zu Handsfree (mSBC)." ;;
         esac
     fi
+}
+
+# ━━━ AUTO-SWITCH BT → HANDSFREE mSBC ━━━
+switch_bt_to_msbc() {
+    # Nur wenn BT-Gerät vorhanden und nicht bereits auf mSBC
+    [[ -z "$BT_SRC_ID" && -z "$BT_SINK_ID" ]] && return 1
+    [[ "$BT_CODEC" == "mSBC" ]] && return 1
+
+    # Finde BT-Karten-Name über pactl
+    local bt_card_name
+    bt_card_name=$(pactl list cards short 2>/dev/null | grep -i 'bluez' | awk '{print $2}' | head -1)
+    [[ -z "$bt_card_name" ]] && return 1
+
+    # Suche nach mSBC Handsfree-Profil in verfügbaren Profilen
+    local msbc_profile=""
+    for p in "${BT_ALL_PROFILES[@]}"; do
+        if echo "$p" | grep -qi 'handsfree.*msbc\|hfp.*msbc\|headunit.*msbc'; then
+            msbc_profile="$p"
+            break
+        fi
+    done
+
+    # Fallback: irgendein Handsfree-Profil
+    if [[ -z "$msbc_profile" ]]; then
+        for p in "${BT_ALL_PROFILES[@]}"; do
+            if echo "$p" | grep -qi 'handsfree\|hfp\|headunit'; then
+                msbc_profile="$p"
+                break
+            fi
+        done
+    fi
+
+    [[ -z "$msbc_profile" ]] && return 1
+
+    echo -e "  ${YELLOW}⚠${NC}  BT-Profil ist ${BOLD}${BT_PROFILE_LABEL}${NC} (${BT_CODEC})"
+    echo -e "  ${DIM}Für Mikrofon-Nutzung wird Handsfree (mSBC) benötigt.${NC}"
+    echo ""
+
+    tput cnorm
+    read -r -p "    Automatisch auf ${msbc_profile} umschalten? [J/n] " answer
+    answer=${answer:-j}
+    tput civis
+
+    if [[ "$answer" =~ ^[jJyY]$ ]]; then
+        echo ""
+        echo -e "  ${DIM}Wechsle Profil → ${msbc_profile}...${NC}"
+        pactl set-card-profile "$bt_card_name" "$msbc_profile" 2>/dev/null
+
+        if (( $? == 0 )); then
+            echo -e "  ${GREEN}✓${NC} Profil umgeschaltet auf ${BOLD}${msbc_profile}${NC}"
+            sleep 1
+            echo ""
+            echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
+            do_restart
+        else
+            echo -e "  ${RED}✗${NC} Profilwechsel fehlgeschlagen"
+            echo ""
+        fi
+    fi
+    echo ""
+    return 0
+}
+
+# ━━━ FREQUENZGANG-PRÜFUNG ━━━
+check_frequency_response() {
+    FREQ_OK=""
+    FREQ_HAS_HIGH=""
+    FREQ_WARNING=""
+    FREQ_BANDWIDTH=""
+
+    # Braucht die Aufnahme-Datei
+    [[ ! -s "$FILE" ]] && return
+
+    # sox stat -freq liefert Frequenz-Amplitude-Paare
+    local freq_data
+    freq_data=$(sox -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer "$FILE" \
+        -n stat -freq 2>&1 | awk '$1 ~ /^[0-9]/ && $2 ~ /^[0-9]/ {print $1, $2}')
+
+    [[ -z "$freq_data" ]] && return
+
+    # Energie in Bändern messen
+    # Band 1: 300-1000 Hz (Grundfrequenz Stimme)
+    # Band 2: 1000-4000 Hz (Klarheit/Verständlichkeit)
+    # Band 3: 4000-8000 Hz (Brillanz/Zischlaute)
+    local energy_low energy_mid energy_high
+    energy_low=$(echo "$freq_data" | awk '$1+0 >= 300 && $1+0 < 1000 {s += $2*$2} END{print s+0}')
+    energy_mid=$(echo "$freq_data" | awk '$1+0 >= 1000 && $1+0 < 4000 {s += $2*$2} END{print s+0}')
+    energy_high=$(echo "$freq_data" | awk '$1+0 >= 4000 && $1+0 < 8000 {s += $2*$2} END{print s+0}')
+
+    # Prüfe ob 4kHz+ vorhanden (CVSD schneidet bei 4kHz ab)
+    if (( $(awk "BEGIN{print ($energy_high > 0 && $energy_mid > 0) ? 1 : 0}") )); then
+        local ratio_high_mid
+        ratio_high_mid=$(awk "BEGIN{printf \"%.2f\", $energy_high / ($energy_mid + 0.001)}")
+
+        if (( $(awk "BEGIN{print ($ratio_high_mid > 0.01) ? 1 : 0}") )); then
+            FREQ_HAS_HIGH="yes"
+            FREQ_BANDWIDTH="Breitband (>4kHz)"
+        else
+            FREQ_HAS_HIGH="no"
+            FREQ_BANDWIDTH="Schmalband (≤4kHz)"
+        fi
+    else
+        FREQ_HAS_HIGH="no"
+        FREQ_BANDWIDTH="Schmalband (≤4kHz)"
+    fi
+
+    # Bewertung
+    if [[ "$FREQ_HAS_HIGH" == "yes" ]]; then
+        FREQ_OK="OK"
+    else
+        FREQ_OK="WARN"
+        if [[ "$BT_CODEC" == "CVSD" ]]; then
+            FREQ_WARNING="CVSD-Codec begrenzt auf 4kHz – Wechsel zu mSBC empfohlen."
+        else
+            FREQ_WARNING="Kein Signal über 4kHz erkannt – Sprachqualität eingeschränkt."
+        fi
+    fi
+}
+
+# ━━━ SNR-BERECHNUNG ━━━
+calculate_snr() {
+    SNR_DB=""
+    SNR_RATING=""
+
+    # Braucht Noise Floor und Signal Peak
+    (( NOISE_PEAK <= 0 )) && NOISE_PEAK=1
+    (( max_peak <= 0 )) && return
+
+    SNR_DB=$(awk "BEGIN{printf \"%.1f\", 20*log($max_peak/$NOISE_PEAK)/log(10)}")
+    local snr_int=${SNR_DB%%.*}
+
+    if (( snr_int >= 40 )); then
+        SNR_RATING="exzellent"
+    elif (( snr_int >= 25 )); then
+        SNR_RATING="gut"
+    elif (( snr_int >= 15 )); then
+        SNR_RATING="akzeptabel"
+    else
+        SNR_RATING="schlecht – Hintergrundgeräusche zu laut"
+    fi
+}
+
+# ━━━ ERGEBNIS LOGGEN ━━━
+log_result() {
+    local timestamp device codec snr_val noise_val peak_val freq_val verdict_val
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    device=$(extract_name "$DEFAULT_SRC_LINE")
+    codec="${BT_CODEC:-n/a}"
+    snr_val="${SNR_DB:-n/a}"
+    noise_val="${NOISE_DB:-n/a}"
+    peak_val="${max_peak:-0}"
+    freq_val="${FREQ_OK:-n/a}"
+    verdict_val="${VERDICT:-FAIL}"
+
+    echo "${timestamp}|${verdict_val}|${device}|${codec}|${snr_val}|${noise_val}|${peak_val}|${freq_val}" >> "$LOG_FILE"
 }
 
 # ━━━ RAUSCHBODEN-MESSUNG ━━━
@@ -604,7 +790,7 @@ if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]]; then
         echo -e "    Profil:  ${CYAN}${BT_PROFILE_LABEL}${NC}"
     fi
     if [[ -n "$BT_CODEC" ]]; then
-        local codec_color="$GREEN"
+        codec_color="$GREEN"
         [[ "$BT_CODEC" == "CVSD" ]] && codec_color="$RED"
         [[ "$BT_CODEC" == "SBC" || "$BT_CODEC" == "SBC-XQ" || "$BT_CODEC" == "AAC" ]] && codec_color="$YELLOW"
         echo -e "    Codec:   ${codec_color}${BT_CODEC}${NC}"
@@ -612,7 +798,7 @@ if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]]; then
     if [[ ${#BT_ALL_PROFILES[@]} -gt 0 ]]; then
         echo -e "    ${DIM}Verfügbare Profile:${NC}"
         for p in "${BT_ALL_PROFILES[@]}"; do
-            local marker=""
+            marker=""
             [[ "$p" == "$BT_PROFILE" ]] && marker=" ${CYAN}← aktiv${NC}"
             echo -e "      ${DIM}• ${p}${NC}${marker}"
         done
@@ -627,6 +813,13 @@ fi
 # ━━━ SMART ROUTING (nur ohne --keep) ━━━
 if (( KEEP_DEVICES == 0 )); then
     tput cnorm
+
+    # Auto-Switch: BT auf Handsfree mSBC wenn A2DP oder CVSD aktiv
+    if [[ "$CURRENT_SRC_TYPE" == "bluetooth" || "$CURRENT_SINK_TYPE" == "bluetooth" ]]; then
+        if [[ "$BT_CODEC" != "mSBC" && -n "$BT_CODEC" ]]; then
+            switch_bt_to_msbc
+        fi
+    fi
 
     # Auto-Fix: Mic=USB aber Ausgabe≠USB
     if [[ "$CURRENT_SRC_TYPE" == "usb" && "$CURRENT_SINK_TYPE" != "usb" && -n "$USB_SINK_ID" ]]; then
@@ -833,6 +1026,33 @@ fi
 echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHASE 2.5:  SNR + Frequenzgang
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if [[ -n "$VERDICT" && "$VERDICT" != "" ]]; then
+    # SNR berechnen
+    calculate_snr
+    if [[ -n "$SNR_DB" ]]; then
+        local_snr_int=${SNR_DB%%.*}
+        snr_color="$GREEN"
+        (( local_snr_int < 25 )) && snr_color="$YELLOW"
+        (( local_snr_int < 15 )) && snr_color="$RED"
+        echo -e "  Signal/Rausch: ${snr_color}${SNR_DB} dB SNR${NC} ${DIM}(${SNR_RATING})${NC}"
+    fi
+
+    # Frequenzgang prüfen
+    check_frequency_response
+    if [[ -n "$FREQ_OK" ]]; then
+        if [[ "$FREQ_OK" == "OK" ]]; then
+            echo -e "  Frequenzgang:  ${GREEN}${FREQ_BANDWIDTH}${NC} ${DIM}(gut für Sprache)${NC}"
+        else
+            echo -e "  Frequenzgang:  ${YELLOW}${FREQ_BANDWIDTH}${NC}"
+            [[ -n "$FREQ_WARNING" ]] && echo -e "                 ${YELLOW}⚠ ${FREQ_WARNING}${NC}"
+        fi
+    fi
+    echo ""
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  PHASE 3:  Kurze Wiedergabe
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if [[ -s "$FILE" && -n "$VERDICT" ]]; then
@@ -890,6 +1110,12 @@ case "$VERDICT" in
         echo -e "  ${YELLOW}${BOLD}⚠  FUNKTIONIERT, ABER PEGEL ANPASSEN${NC}"
         ;;
 esac
+
+# Ergebnis loggen
+if [[ -n "$VERDICT" ]]; then
+    log_result
+    echo -e "  ${DIM}Gespeichert in ${LOG_FILE}${NC}"
+fi
 
 echo ""
 tput cnorm

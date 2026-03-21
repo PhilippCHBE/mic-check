@@ -10,19 +10,23 @@
 
 1. **Detects audio server** – shows PipeWire or PulseAudio with version info
 2. **Detects audio devices** – USB, Bluetooth, and internal microphones/speakers
-3. **Shows Bluetooth codec/profile** – active codec (mSBC, CVSD, SBC, AAC), warns if suboptimal for mic use
-4. **Smart routing** – suggests switching to the best available device (USB > BT > Internal)
-5. **Auto-fix mismatches** – if your mic is USB but output is internal, it corrects automatically
-6. **Noise floor measurement** – 1-second silence test to check ambient noise level
-7. **Live VU-meter** – 3-second recording with real-time peak level display
-8. **Playback test** – plays back your recording so you can hear yourself
-9. **Clear verdict** – ✅ Ready / ⚠ Adjust level / ❌ Problem
+3. **Shows Bluetooth codec/profile** – active codec (mSBC, CVSD, SBC, AAC), warns if suboptimal
+4. **Auto-switches BT to Handsfree mSBC** – when A2DP or CVSD is active, offers to switch to mSBC for best mic quality
+5. **Smart routing** – suggests switching to the best available device (USB > BT > Internal)
+6. **Auto-fix mismatches** – if your mic is USB but output is internal, it corrects automatically
+7. **Noise floor measurement** – 1-second silence test to check ambient noise level
+8. **Live VU-meter** – 3-second recording with real-time peak level display
+9. **Signal-to-noise ratio (SNR)** – calculates and rates SNR from noise floor vs speech level
+10. **Frequency response check** – detects 4kHz cutoff (CVSD codec limitation)
+11. **Playback test** – plays back your recording so you can hear yourself
+12. **History log** – saves all test results to `~/.mic-check.log` for tracking over time
+13. **Clear verdict** – ✅ Ready / ⚠ Adjust level / ❌ Problem
 
 ## Screenshot
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  🎧 PRE-CALL MIC CHECK  v1.4.1
+  🎧 PRE-CALL MIC CHECK  v1.4.2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Audio:     PipeWire (+ PulseAudio-Compat) v1.0.7 + wireplumber
@@ -56,9 +60,13 @@
 
   ✓ PEGEL OK
 
+  Signal/Rausch: 40.0 dB SNR (exzellent)
+  Frequenzgang:  Breitband (>4kHz) (gut für Sprache)
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ✓ BEREIT FÜR DEN ANRUF
+  Gespeichert in ~/.mic-check.log
 ```
 
 ## Installation
@@ -103,6 +111,9 @@ source ~/.bashrc
 # List all audio devices
 ./mic-check.sh --list
 
+# Show test history
+./mic-check.sh --history
+
 # Show version
 ./mic-check.sh --version
 
@@ -119,6 +130,7 @@ source ~/.bashrc
 | `--keep`    | Keep current devices, don't suggest switching    |
 | `--debug`   | Show debug info for device detection             |
 | `--list`    | List all audio devices via `wpctl status`        |
+| `--history` | Show last 20 test results from log file          |
 
 ## How it works
 
@@ -128,6 +140,7 @@ source ~/.bashrc
 - Identifies default source (mic) and sink (output)
 - Detects USB and Bluetooth devices by name patterns
 - Shows Bluetooth codec/profile and warns about suboptimal choices
+- **Auto-switches BT to Handsfree mSBC** if A2DP or CVSD is detected
 - Shows volume levels and mute status
 - Offers to switch to better devices if available
 
@@ -143,7 +156,7 @@ For **microphone usage**, your BT headset must use a **Handsfree (HFP)** profile
 | SBC    | Headphones | ❌   | Medium  | Music only, no mic |
 | AAC    | Headphones | ❌   | High    | Music only, no mic |
 
-The script detects which profile is active and warns if a Headphones (A2DP) profile is in use while testing the microphone.
+The script detects which profile is active and **automatically offers to switch** to Handsfree mSBC when a non-optimal profile is in use.
 
 ### Phase 1.5 – Noise Floor
 - Records 1 second of silence
@@ -155,15 +168,21 @@ The script detects which profile is active and warns if a Headphones (A2DP) prof
 - Displays real-time VU-meter with peak levels in dB
 - Evaluates: no signal / too quiet / OK / clipping
 
+### Phase 2.5 – Signal Analysis
+- **Signal-to-Noise Ratio (SNR)**: Calculates SNR from noise floor vs speech peak, rated as excellent (≥40dB) / good (≥25dB) / acceptable (≥15dB) / poor (<15dB)
+- **Frequency Response Check**: Analyzes energy in 3 bands (300–1kHz, 1–4kHz, 4–8kHz) to detect if the mic cuts off above 4kHz – a telltale sign of CVSD codec limitation
+
 ### Phase 3 – Playback
 - Plays back the recording through your speakers/headphones
 - Shows output VU-meter during playback
 - You can judge your own audio quality
 
-### Verdict
+### Verdict & Logging
 - **✅ BEREIT FÜR DEN ANRUF** – Ready for the call
 - **⚠ FUNKTIONIERT, ABER PEGEL ANPASSEN** – Works, but adjust level
 - **❌ MIKROFON PROBLEM – NICHT ANRUFEN** – Mic problem, don't call
+- Results are saved to `~/.mic-check.log` with timestamp, device, codec, SNR, noise floor, peak level, and frequency check result
+- View history with `./mic-check.sh --history`
 
 ## Device Priority
 
