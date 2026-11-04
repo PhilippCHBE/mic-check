@@ -3,18 +3,42 @@
 #  PRE-CALL MIC CHECK
 #  mit USB / Bluetooth Auto-Erkennung
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION="1.4.4"
-export LANG=C.UTF-8
+VERSION="1.5.0"
+# Stabile (englische) Ausgabe von pactl/sox und '.' als Dezimalpunkt.
+# LANG allein reicht nicht, wenn der Benutzer LC_ALL oder LC_MESSAGES setzt.
+export LC_ALL=C.UTF-8
 
-# --- CONFIG ---
-CHECK_SECS=3
+# --- CONFIG (kann in ~/.config/mic-check/config überschrieben werden) ---
+CHECK_SECS=3          # Länge der Sprachaufnahme
+NOISE_SECS=1          # Länge der Rauschboden-Messung
+WAIT_SECS=5           # max. Wartezeit, bis du zu sprechen beginnst
 RATE=44100
 CHANNELS=1
-BITS=16
-BAR_W=25
-MAX_RESTARTS=2
+BITS=16               # muss 16 bleiben (Auswertung liest 16-Bit-Samples)
+CHUNKS_PER_SEC=10     # Aktualisierungsrate der Pegelanzeige
+BAR_W=30              # Breite der Pegelanzeige (Zeichen)
+DB_FLOOR=-60          # linker Rand der Pegelanzeige (dBFS)
+MAX_AUTO_SWITCHES=4   # Schutz gegen Umschalt-Schleifen
 LOG_FILE="${HOME}/.mic-check.log"
-# --------------
+
+# Bewertung (dBFS)
+LVL_NO_SIGNAL=-40     # Sprach-Peak darunter → kein Signal
+LVL_QUIET=-24         # darunter → zu leise
+LVL_CLIP=-1           # darüber → übersteuert
+LVL_TARGET=-9         # Ziel-Peak der automatischen Gain-Korrektur
+NOISE_GOOD=-56        # Rauschboden (RMS) darunter → sehr gut
+NOISE_OK=-44          # darunter → akzeptabel, sonst hoch
+SNR_EXCELLENT=30
+SNR_GOOD=20
+SNR_OK=12             # darunter → Hintergrund zu laut
+BW_MIN_DB=-30         # Energie 4.5–7.5 kHz relativ zu 1–4 kHz; darunter → Schmalband
+MAX_GAIN_PCT=150      # Obergrenze der Gain-Korrektur
+BATTERY_WARN=20       # BT-Akku in %, darunter Warnung
+READ_PROMPT="Sechs Schweizer Spezialisten testen das Mikrofon."
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/mic-check/config"
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+# -----------------------------------------------------------------------
 
 show_help() {
     cat <<EOF
@@ -23,1173 +47,1740 @@ mic-check v${VERSION} – Schneller Mikrofon-Test vor Anrufen
 Verwendung:  ./mic-check.sh [OPTIONEN]
 
 Optionen:
-  --help      Diese Hilfe anzeigen
-  --version   Versionsnummer anzeigen
-  --keep      Aktuelle Geräte beibehalten,
-              kein Umschalten vorschlagen
-  --debug     Debug-Infos zur Geräte-Erkennung
-  --list      Alle Audio-Geräte auflisten
-  --history   Letzte Test-Ergebnisse anzeigen
+  --help          Diese Hilfe anzeigen
+  --version       Versionsnummer anzeigen
+  --keep          Aktuelle Geräte beibehalten, nichts umschalten
+  --no-playback   Aufnahme nicht abspielen (kein Ausgabe-Test)
+  --no-menu       Nach dem Ergebnis direkt beenden
+  --no-clear      Bildschirm vorher nicht löschen
+  --ascii         Ohne Emojis (bei Darstellungsproblemen im Terminal)
+  --debug         Debug-Infos zur Geräte-Erkennung
+  --list          Alle Audio-Geräte auflisten
+  --history [N]   Letzte N Test-Ergebnisse anzeigen (Standard: 20)
 
 Was das Script macht:
-  1. Erkennt Audio-Server (PipeWire / PulseAudio)
-  2. Prüft Mikrofon- und Ausgabe-Gerät
-  3. Zeigt Bluetooth-Codec/Profil (mSBC, CVSD, SBC, AAC)
-  4. Wechselt BT automatisch auf Handsfree mSBC
-  5. Erkennt USB / Bluetooth Headsets
-  6. Schlägt Umschalten vor (USB > BT > Intern)
-  7. Misst Rauschboden (Noise Floor)
-  8. ${CHECK_SECS}-Sekunden Live-Pegeltest mit VU-Meter
-  9. Frequenzgang-Prüfung (4kHz-Cutoff-Erkennung)
- 10. Berechnet Signal-Rausch-Abstand (SNR)
- 11. Kurze Wiedergabe zur Kontrolle
- 12. Speichert Ergebnisse in ${LOG_FILE}
+  1. Erkennt Audio-Server, Mikrofon und Ausgabe (USB / Bluetooth / Intern)
+  2. Schlägt das beste Gerät vor (USB > Bluetooth > Webcam > Intern)
+  3. Wechselt Bluetooth auf das beste Headset-Profil (z.B. CVSD → mSBC)
+  4. Bietet an, stummes Mikrofon / stumme Ausgabe einzuschalten
+  5. Misst Rauschboden, Sprachpegel, SNR und Bandbreite (4kHz-Cutoff)
+  6. Spielt die Aufnahme ab und fragt, ob du dich gehört hast
+  7. Prüft, ob laufende Apps (Zoom, Browser…) das getestete Mikro nutzen
+  8. Warnt vor Echo-Gefahr und schwachem Headset-Akku
+  9. Korrigiert den Mic-Pegel auf Tastendruck
+ 10. Speichert Ergebnisse in ${LOG_FILE}
 
-Abhängigkeiten:  sox (sudo pacman -S sox)
+Tasten nach dem Test:
+  Enter/q Ende · r Nochmal · p Anhören · g Gain anpassen
+  a Apps umleiten · d Gerät wählen
 
-Alias-Tipp:  echo 'alias miccheck="~/mic-check.sh"' >> ~/.bashrc
+Abhängigkeiten:  sox, pactl (libpulse bzw. pulseaudio-utils)
+Konfiguration:   ${CONFIG_FILE}
+
+Alias-Tipp:  echo 'alias miccheck="~/mic-check/mic-check.sh"' >> ~/.bashrc
 EOF
-    exit 0
+}
+
+# ━━━ OPTIONEN ━━━
+KEEP_DEVICES=0
+DEBUG=0
+NO_PLAYBACK=0
+NO_MENU=0
+NO_CLEAR=0
+ASCII=0
+ACTION="check"
+HISTORY_N=20
+
+while (( $# )); do
+    case "$1" in
+        --help|-h)     ACTION="help" ;;
+        --version|-v)  ACTION="version" ;;
+        --keep)        KEEP_DEVICES=1 ;;
+        --debug)       DEBUG=1 ;;
+        --list)        ACTION="list" ;;
+        --history)
+            ACTION="history"
+            if [[ "${2:-}" =~ ^[0-9]+$ ]]; then HISTORY_N=$2; shift; fi ;;
+        --no-playback) NO_PLAYBACK=1 ;;
+        --no-menu)     NO_MENU=1 ;;
+        --no-clear)    NO_CLEAR=1 ;;
+        --ascii)       ASCII=1 ;;
+        *)
+            echo "mic-check: unbekannte Option '$1' (siehe --help)" >&2
+            exit 2 ;;
+    esac
+    shift
+done
+
+# ━━━ AUSGABE / FARBEN / SYMBOLE ━━━
+IS_TTY=0;      [[ -t 1 ]] && IS_TTY=1
+INTERACTIVE=0; [[ -t 0 && -t 1 ]] && INTERACTIVE=1
+TIMEOUT_CMD=(); command -v timeout >/dev/null && TIMEOUT_CMD=(timeout 5)
+
+setup_ui() {
+    if (( IS_TTY )) && [[ -z "${NO_COLOR:-}" ]]; then
+        RED=$'\e[0;31m'; GREEN=$'\e[0;32m'; YELLOW=$'\e[1;33m'; CYAN=$'\e[0;36m'
+        BOLD=$'\e[1m'; DIM=$'\e[2m'; NC=$'\e[0m'
+        BG_RED=$'\e[41m'; BG_GREEN=$'\e[42m'; BG_YELLOW=$'\e[43;30m'
+    else
+        RED=""; GREEN=""; YELLOW=""; CYAN=""; BOLD=""; DIM=""; NC=""
+        BG_RED=""; BG_GREEN=""; BG_YELLOW=""
+    fi
+    EL=""; (( IS_TTY )) && EL=$'\e[K'
+
+    if (( ASCII )); then
+        I_TITLE="MIC CHECK"; I_MIC="MIC"; I_OUT="OUT"; I_HUSH="..."; I_SAY=">>"
+        I_HEADSET="Headset"; I_MUSIC="Musik"; I_BAT="Akku"; I_WAIT="..."
+        I_OK="OK"; I_WARN="!"; I_FAIL="X"; I_INFO="i"; I_REDO="->"; I_DOT="*"; I_REC="REC"
+        I_READY="[OK]"; I_NOTREADY="[X]"; I_WARNB="[!] "; SEP="|"
+        BAR_FULL="#"; BAR_EMPTY="."; BAR_ZONE=":"; BAR_PEAK="|"
+    else
+        I_TITLE="🎧🎙 MIC CHECK"; I_MIC="🎤"; I_OUT="🔊"; I_HUSH="🤫"; I_SAY="💬"
+        I_HEADSET="🎧🎙 Headset"; I_MUSIC="🎧 Musik"; I_BAT="🔋"; I_WAIT="⏳"
+        I_OK="✓"; I_WARN="⚠"; I_FAIL="✗"; I_INFO="ℹ"; I_REDO="↻"; I_DOT="●"; I_REC="● REC"
+        I_READY="✅"; I_NOTREADY="❌"; I_WARNB="⚠  "; SEP="│"
+        BAR_FULL="█"; BAR_EMPTY="░"; BAR_ZONE="▒"; BAR_PEAK="│"
+    fi
+
+    # Schmale Terminals: Pegelanzeige verkürzen, damit die Live-Zeile nicht umbricht
+    if (( IS_TTY )); then
+        local cols
+        cols=$(tput cols 2>/dev/null)
+        if [[ "$cols" =~ ^[0-9]+$ ]] && (( cols < BAR_W + 48 )); then
+            BAR_W=$(( cols - 48 ))
+            (( BAR_W < 10 )) && BAR_W=10
+        fi
+    fi
+
+    # Zielzone der Pegelanzeige (in Zeichen)
+    db_cells "$LVL_QUIET"; ZONE_START=$REPLY
+    db_cells "$LVL_CLIP";  ZONE_END=$(( REPLY - 1 ))
+}
+
+say()      { printf '%s\n' "$*"; }
+cur_hide() { (( IS_TTY )) && tput civis 2>/dev/null; return 0; }
+cur_show() { (( IS_TTY )) && tput cnorm 2>/dev/null; return 0; }
+# Gleitkomma-Vergleich: flt A B  →  wahr, wenn A < B
+flt()      { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; }
+# dBFS → Anzahl Zeichen der Pegelanzeige (REPLY)
+db_cells() {
+    REPLY=$(awk -v d="$1" -v f="$DB_FLOOR" -v w="$BAR_W" \
+        'BEGIN { c = int((d - f) / (-f) * w); if (c < 0) c = 0; if (c > w) c = w; print c }')
+}
+# Restliche Tastendrücke (z.B. Pfeiltasten-Sequenzen) verwerfen
+drain_keys() { local _k; while read -rsn1 -t 0.01 _k; do :; done; return 0; }
+
+# ━━━ ABFRAGEN ━━━
+ask_yn() {   # $1 = Frage → 0 = ja (Standard), 1 = nein / nicht interaktiv
+    (( INTERACTIVE )) || return 1
+    local ans
+    cur_show
+    read -r -p "    $1 [J/n] " ans
+    cur_hide
+    [[ -z "$ans" || "$ans" =~ ^[jJyY] ]]
+}
+
+countdown() {   # $1 = Nachricht, $2 = Sekunden → 0 = ausführen, 1 = übersprungen
+    (( INTERACTIVE )) || return 1
+    local msg="$1" secs="${2:-3}" key end remain
+    cur_show
+    # Restzeit kommt aus der Uhr: Tastendrücke verkürzen den Countdown nicht
+    end=$(( SECONDS + secs ))
+    while (( (remain = end - SECONDS) > 0 )); do
+        printf '\r    %s%s %s in %s%ss%s%s – [beliebige Taste] = überspringen%s%s' \
+            "$YELLOW" "$I_WAIT" "$msg" "$BOLD" "$remain" "$NC" "$YELLOW" "$NC" "$EL"
+        if read -rsn1 -t 1 key; then
+            drain_keys
+            printf '\r    %s↷ Übersprungen.%s%s\n' "$DIM" "$NC" "$EL"
+            cur_hide
+            return 1
+        fi
+    done
+    printf '\r%s' "$EL"
+    cur_hide
+    return 0
+}
+
+# ━━━ GERÄTE-ERKENNUNG (pactl) ━━━
+# pactl funktioniert mit PipeWire (pipewire-pulse) und PulseAudio und hat –
+# anders als 'wpctl status' – ein über Versionen stabiles Ausgabeformat.
+# Geräte werden über ihre Eigenschaften (node.name, device.api, device.bus)
+# erkannt statt über Markennamen in der Beschreibung.
+
+PA_NODE_AWK='
+function val(s) { sub(/^[^"]*"/, "", s); sub(/"[^"]*$/, "", s); return s }
+function rest(s) { return substr(s, index(s, ": ") + 2) }
+function flush() {
+    if (name != "" && !mon && name !~ /capture_internal/ && mclass !~ /Internal/) {
+        gsub(/\|/, "/", desc)
+        print name "|" desc "|" mute "|" vol "|" api "|" bus "|" ff "|" addr "|" codec "|" port
+    }
+    name = desc = mute = vol = api = bus = ff = addr = codec = port = mclass = ""; mon = 0
+}
+/^(Source|Sink) #/                  { flush(); next }
+/^\tName: /                         { name = rest($0); next }
+/^\tDescription: /                  { desc = rest($0); next }
+/^\tMute: /                         { mute = $2; next }
+/^\tVolume: /                       { if (vol == "" && match($0, /[0-9]+%/)) vol = substr($0, RSTART, RLENGTH - 1); next }
+/^\tMonitor of Sink: /              { if ($0 !~ /n\/a$/) mon = 1; next }
+/^\tActive Port: /                  { port = rest($0); next }
+/^\t\tdevice\.api = /               { api = val($0); next }
+/^\t\tdevice\.bus = /               { bus = val($0); next }
+/^\t\tdevice\.form_factor = /       { ff = val($0); next }
+/^\t\tdevice\.class = "monitor"/    { mon = 1; next }
+/^\t\tapi\.bluez5\.address = /      { addr = val($0); next }
+/^\t\tapi\.bluez5\.codec = /        { codec = val($0); next }
+/^\t\tmedia\.class = /              { mclass = val($0); next }
+END { flush() }
+'
+
+PA_CARD_AWK='
+function val(s) { sub(/^[^"]*"/, "", s); sub(/"[^"]*$/, "", s); return s }
+function rest(s) { return substr(s, index(s, ": ") + 2) }
+/^Card #/                           { name = addr = desc = api = ""; inprof = 0; next }
+/^\tName: /                         { name = rest($0); next }
+/^\t\tapi\.bluez5\.address = /      { addr = val($0); next }
+/^\t\tdevice\.description = /       { desc = val($0); next }
+/^\t\tdevice\.api = /               { api = val($0); next }
+/^\tProfiles:/                      { inprof = 1; next }
+/^\tActive Profile: /               { gsub(/\|/, "/", desc); print "C|" name "|" addr "|" desc "|" api "|" rest($0); inprof = 0; next }
+/^\t[^\t]/                          { inprof = 0; next }
+inprof && /^\t\t[^\t]/ {
+    l = substr($0, 3)
+    pn = substr(l, 1, index(l, ": ") - 1)
+    pd = substr(l, index(l, ": ") + 2)
+    snk = 0; src = 0; av = "yes"
+    if (match(pd, /sinks: [0-9]+/))      snk = substr(pd, RSTART + 7, RLENGTH - 7)
+    if (match(pd, /sources: [0-9]+/))    src = substr(pd, RSTART + 9, RLENGTH - 9)
+    if (match(pd, /available: [a-z]+/))  av = substr(pd, RSTART + 11, RLENGTH - 11)
+    lbl = pd; sub(/ \(sinks: .*$/, "", lbl)
+    cod = ""
+    if (match(lbl, /codec [^),]+/)) cod = substr(lbl, RSTART + 6, RLENGTH - 6)
+    gsub(/\|/, "/", lbl)
+    print "P|" name "|" pn "|" lbl "|" snk "|" src "|" av "|" cod
+}
+'
+
+PA_SO_AWK='
+function val(s) { sub(/^[^"]*"/, "", s); sub(/"[^"]*$/, "", s); return s }
+function flush() {
+    if (idx != "") { gsub(/\|/, "/", app); gsub(/\|/, "/", bin); gsub(/\|/, "/", media); print idx "|" src "|" app "|" bin "|" media }
+    idx = src = app = bin = media = ""
+}
+/^Source Output #/                       { flush(); idx = substr($0, index($0, "#") + 1); next }
+/^\tSource: /                            { src = $2; next }
+/^\t\tapplication\.name = /              { app = val($0); next }
+/^\t\tapplication\.process\.binary = /   { bin = val($0); next }
+/^\t\tmedia\.name = /                    { media = val($0); next }
+END { flush() }
+'
+
+# Verbindungstyp aus Node-Eigenschaften (REPLY)
+classify_node() {   # $1=name $2=device.api $3=device.bus $4=form_factor $5=Beschreibung
+    local n="${1,,}" api="${2,,}" bus="${3,,}" ff="${4,,}" d="${5,,}"
+    if [[ "$n" == bluez* || "$api" == bluez* || "$bus" == bluetooth ]]; then
+        REPLY="bluetooth"
+    elif [[ "$bus" == usb || "$n" == alsa_*.usb-* ]]; then
+        if [[ "$ff" == webcam || "$d" == *webcam* || "$d" == *camera* || "$d" == *brio* \
+              || "$d" =~ (^|[^a-z])c9[0-9][0-9]([^0-9]|$) ]]; then
+            REPLY="webcam"
+        else
+            REPLY="usb"
+        fi
+    elif [[ "$n" == alsa_* || "$api" == alsa ]]; then
+        if [[ "$n" == *hdmi* || "$d" == *hdmi* || "$d" == *displayport* ]]; then
+            REPLY="hdmi"
+        else
+            REPLY="internal"
+        fi
+    else
+        REPLY="virtual"   # Filter, Effekte (EasyEffects, Rauschfilter, Echo-Cancel …)
+    fi
+}
+
+# Bluetooth-Adresse aus einem Node-/Kartennamen (REPLY, Format AA:BB:…)
+mac_from() {
+    REPLY=""
+    if [[ "$1" =~ ([0-9A-Fa-f]{2}[_:]){5}[0-9A-Fa-f]{2} ]]; then
+        REPLY="${BASH_REMATCH[0]//_/:}"
+        REPLY="${REPLY^^}"
+    fi
+}
+
+# Geräteschlüssel: verbindet Mikrofon, Ausgabe und Karte desselben Geräts (REPLY)
+device_key() {   # $1=name $2=BT-Adresse
+    local n="$1" s
+    if [[ -n "$2" ]]; then
+        REPLY="bt:${2^^}"
+    elif [[ "$n" == alsa_card.* ]]; then
+        REPLY="alsa:${n#alsa_card.}"
+    elif [[ "$n" == alsa_* ]]; then
+        s="${n#*.}"
+        REPLY="alsa:${s%.*}"
+    else
+        REPLY="node:$n"
+    fi
+}
+
+codec_label() {   # Rohname → Anzeigename (REPLY)
+    case "${1,,}" in
+        "")                           REPLY="" ;;
+        msbc)                         REPLY="mSBC" ;;
+        cvsd)                         REPLY="CVSD" ;;
+        sbc)                          REPLY="SBC" ;;
+        sbc_xq|sbc-xq)                REPLY="SBC-XQ" ;;
+        aac*)                         REPLY="AAC" ;;
+        ldac)                         REPLY="LDAC" ;;
+        aptx)                         REPLY="aptX" ;;
+        aptx_hd|aptx-hd|"aptx hd")    REPLY="aptX HD" ;;
+        aptx_ll*|aptx-ll*|"aptx ll"*) REPLY="aptX LL" ;;
+        faststream*)                  REPLY="FastStream" ;;
+        lc3_swb|lc3-swb|"lc3 swb")    REPLY="LC3-SWB" ;;
+        lc3*)                         REPLY="LC3" ;;
+        opus*)                        REPLY="Opus" ;;
+        *)                            REPLY="$1" ;;
+    esac
+}
+
+codec_khz() {   # Abtastrate des Mikrofons je Codec (REPLY, leer = unbekannt)
+    case "$1" in
+        CVSD)    REPLY="8 kHz" ;;
+        mSBC)    REPLY="16 kHz" ;;
+        LC3-SWB) REPLY="32 kHz" ;;
+        *)       REPLY="" ;;
+    esac
+}
+
+mic_rank() {   # Mikrofon-Qualität eines Headset-Codecs (REPLY, höher = besser)
+    case "$1" in
+        LC3-SWB|LC3)               REPLY=5 ;;
+        mSBC)                      REPLY=4 ;;
+        FastStream|"aptX LL"|Opus) REPLY=3 ;;
+        CVSD)                      REPLY=1 ;;
+        *)                         REPLY=2 ;;
+    esac
+}
+
+src_rank() {   # Bevorzugung beim Vorschlagen (REPLY)
+    case "$1" in
+        usb)       REPLY=4 ;;
+        bluetooth) REPLY=3 ;;
+        webcam)    REPLY=2 ;;
+        internal)  REPLY=1 ;;
+        *)         REPLY=0 ;;
+    esac
+}
+
+type_label() {   # kurzes, farbiges Label (REPLY)
+    case "$1" in
+        usb)       REPLY="${GREEN}USB${NC}" ;;
+        bluetooth) REPLY="${CYAN}BT${NC}" ;;
+        webcam)    REPLY="${CYAN}Webcam${NC}" ;;
+        internal)  REPLY="${DIM}Intern${NC}" ;;
+        hdmi)      REPLY="${DIM}HDMI${NC}" ;;
+        virtual)   REPLY="${DIM}Virtuell${NC}" ;;
+        *)         REPLY="${DIM}–${NC}" ;;
+    esac
+}
+
+type_name() {   # ausgeschrieben (REPLY)
+    case "$1" in
+        usb)       REPLY="USB-Mikrofon" ;;
+        bluetooth) REPLY="Bluetooth-Headset" ;;
+        webcam)    REPLY="Webcam-Mikrofon" ;;
+        internal)  REPLY="internes Mikrofon" ;;
+        hdmi)      REPLY="HDMI" ;;
+        virtual)   REPLY="virtuelle Quelle" ;;
+        *)         REPLY="kein Mikrofon" ;;
+    esac
+}
+
+load_nodes() {   # $1 = sources|sinks, $2 = Array-Präfix (SRC|SINK)
+    local -n _name="${2}_NAME" _desc="${2}_DESC" _mute="${2}_MUTE" _vol="${2}_VOL" \
+             _type="${2}_TYPE" _key="${2}_KEY" _codec="${2}_CODEC" _port="${2}_PORT"
+    _name=(); _desc=(); _mute=(); _vol=(); _type=(); _key=(); _codec=(); _port=()
+    local name desc mute vol api bus ff addr codec port i=0
+    while IFS='|' read -r name desc mute vol api bus ff addr codec port; do
+        [[ -z "$name" ]] && continue
+        _name[i]="$name"
+        _desc[i]="${desc:-$name}"
+        _mute[i]="$mute"
+        _vol[i]="${vol:-0}"
+        classify_node "$name" "$api" "$bus" "$ff" "$desc"
+        _type[i]="$REPLY"
+        if [[ -z "$addr" && "$REPLY" == bluetooth ]]; then
+            mac_from "$name"; addr="$REPLY"
+        fi
+        device_key "$name" "$addr"
+        _key[i]="$REPLY"
+        codec_label "$codec"
+        _codec[i]="$REPLY"
+        _port[i]="$port"
+        (( i++ ))
+    done < <(pactl list "$1" 2>/dev/null | awk "$PA_NODE_AWK")
+}
+
+load_cards() {
+    CARD_NAME=(); CARD_ADDR=(); CARD_DESC=(); CARD_ACTIVE=(); CARD_KEY=(); CARD_BEST_MIC=()
+    PROF_CARD=(); PROF_NAME=(); PROF_LABEL=(); PROF_SOURCES=(); PROF_AVAIL=(); PROF_CODEC=()
+    local -A cidx=()
+    local -a pcard=()
+    local tag f1 f2 f3 f5 f6 f7 c=0 j=0 addr
+    while IFS='|' read -r tag f1 f2 f3 _ f5 f6 f7; do
+        if [[ "$tag" == C ]]; then
+            addr="$f2"
+            if [[ -z "$addr" && "${f1,,}" == bluez* ]]; then mac_from "$f1"; addr="$REPLY"; fi
+            CARD_NAME[c]="$f1"; CARD_ADDR[c]="$addr"; CARD_DESC[c]="${f3:-$f1}"; CARD_ACTIVE[c]="$f5"
+            device_key "$f1" "$addr"; CARD_KEY[c]="$REPLY"
+            cidx["$f1"]=$c
+            (( c++ ))
+        elif [[ "$tag" == P ]]; then
+            pcard[j]="$f1"; PROF_NAME[j]="$f2"; PROF_LABEL[j]="$f3"
+            PROF_SOURCES[j]="${f5:-0}"; PROF_AVAIL[j]="$f6"
+            codec_label "$f7"; PROF_CODEC[j]="$REPLY"
+            (( j++ ))
+        fi
+    done < <(pactl list cards 2>/dev/null | awk "$PA_CARD_AWK")
+
+    for j in "${!PROF_NAME[@]}"; do
+        PROF_CARD[j]="${cidx[${pcard[j]}]:--1}"
+    done
+
+    # Bestes (verfügbares) Headset-Profil mit Mikrofon je Karte
+    local best best_rank
+    for c in "${!CARD_NAME[@]}"; do
+        best=""; best_rank=0
+        for j in "${!PROF_NAME[@]}"; do
+            (( PROF_CARD[j] == c && PROF_SOURCES[j] > 0 )) || continue
+            [[ "${PROF_AVAIL[j]}" == no ]] && continue
+            mic_rank "${PROF_CODEC[j]}"
+            if (( REPLY > best_rank )); then best=$j; best_rank=$REPLY; fi
+        done
+        CARD_BEST_MIC[c]="$best"
+    done
+}
+
+profile_index() {   # $1 = Karte, $2 = Profilname → REPLY = Index oder -1
+    local j
+    REPLY=-1
+    for j in "${!PROF_NAME[@]}"; do
+        if (( PROF_CARD[j] == $1 )) && [[ "${PROF_NAME[j]}" == "$2" ]]; then REPLY=$j; return; fi
+    done
+}
+
+card_for_key() {
+    local c
+    REPLY=-1
+    for c in "${!CARD_NAME[@]}"; do
+        [[ "${CARD_KEY[c]}" == "$1" ]] && { REPLY=$c; return; }
+    done
+}
+
+source_for_key() {
+    local i
+    REPLY=-1
+    for i in "${!SRC_NAME[@]}"; do
+        [[ "${SRC_KEY[i]}" == "$1" ]] && { REPLY=$i; return; }
+    done
+}
+
+sink_for_key() {   # bevorzugt Analog vor Digital (IEC958/S/PDIF)
+    local i digital=-1 n
+    REPLY=-1
+    for i in "${!SINK_NAME[@]}"; do
+        [[ "${SINK_KEY[i]}" == "$1" ]] || continue
+        n="${SINK_NAME[i],,} ${SINK_DESC[i],,}"
+        if [[ "$n" == *iec958* || "$n" == *spdif* || "$n" == *s/pdif* || "$n" == *digital* ]]; then
+            (( digital < 0 )) && digital=$i
+        else
+            REPLY=$i; return
+        fi
+    done
+    REPLY=$digital
+}
+
+is_skipped() {   # Gerät wurde abgelehnt oder hatte kein Signal
+    [[ -n "${DECLINED[$1]:-}" || -n "${NOSIG_TRIED[$1]:-}" ]]
+}
+
+detect_all() {
+    local info line
+    info=$(pactl info 2>/dev/null) || return 1
+    SERVER_NAME=""; SERVER_VERSION=""; DEFAULT_SOURCE=""; DEFAULT_SINK=""
+    while IFS= read -r line; do
+        case "$line" in
+            "Server Name: "*)    SERVER_NAME="${line#Server Name: }" ;;
+            "Server Version: "*) SERVER_VERSION="${line#Server Version: }" ;;
+            "Default Source: "*) DEFAULT_SOURCE="${line#Default Source: }" ;;
+            "Default Sink: "*)   DEFAULT_SINK="${line#Default Sink: }" ;;
+        esac
+    done <<< "$info"
+
+    if [[ "$SERVER_NAME" =~ PipeWire[[:space:]]+([0-9.]+) ]]; then
+        AUDIO_SRV="PipeWire v${BASH_REMATCH[1]}"
+    elif [[ "$SERVER_NAME" == *PipeWire* ]]; then
+        AUDIO_SRV="PipeWire"
+    else
+        AUDIO_SRV="PulseAudio${SERVER_VERSION:+ v$SERVER_VERSION}"
+    fi
+    if command -v pgrep >/dev/null && pgrep -x wireplumber >/dev/null 2>&1; then
+        AUDIO_SRV+=" + wireplumber"
+    fi
+
+    load_nodes sources SRC
+    load_nodes sinks SINK
+    load_cards
+
+    local i
+    CUR_SRC=-1; CUR_SINK=-1
+    for i in "${!SRC_NAME[@]}";  do [[ "${SRC_NAME[i]}"  == "$DEFAULT_SOURCE" ]] && CUR_SRC=$i;  done
+    for i in "${!SINK_NAME[@]}"; do [[ "${SINK_NAME[i]}" == "$DEFAULT_SINK" ]]   && CUR_SINK=$i; done
+
+    MIC_DESC=""; (( CUR_SRC >= 0 ))  && MIC_DESC="${SRC_DESC[CUR_SRC]}"
+    OUT_DESC=""; (( CUR_SINK >= 0 )) && OUT_DESC="${SINK_DESC[CUR_SINK]}"
+
+    # Bluetooth: aktives Gerät (Mikrofon hat Vorrang vor Ausgabe)
+    BT_KEY=""; BT_CARD=-1; BT_CODEC=""; BT_ADDR=""; BT_BATTERY=""; BT_ROLE=""
+    if (( CUR_SRC >= 0 )) && [[ "${SRC_TYPE[CUR_SRC]}" == bluetooth ]]; then
+        BT_KEY="${SRC_KEY[CUR_SRC]}"; BT_CODEC="${SRC_CODEC[CUR_SRC]}"; BT_ROLE="mic"
+    elif (( CUR_SINK >= 0 )) && [[ "${SINK_TYPE[CUR_SINK]}" == bluetooth ]]; then
+        BT_KEY="${SINK_KEY[CUR_SINK]}"; BT_CODEC="${SINK_CODEC[CUR_SINK]}"; BT_ROLE="out"
+    fi
+    if [[ -n "$BT_KEY" ]]; then
+        card_for_key "$BT_KEY"; BT_CARD=$REPLY
+        [[ "$BT_KEY" == bt:* ]] && BT_ADDR="${BT_KEY#bt:}"
+        if (( BT_CARD >= 0 )); then
+            profile_index "$BT_CARD" "${CARD_ACTIVE[BT_CARD]}"
+            # Codec des aktiven Profils ist verlässlicher als die Node-Eigenschaft
+            (( REPLY >= 0 )) && [[ -n "${PROF_CODEC[REPLY]}" ]] && BT_CODEC="${PROF_CODEC[REPLY]}"
+        fi
+        if [[ -n "$BT_ADDR" ]] && command -v bluetoothctl >/dev/null; then
+            local bt_info
+            bt_info=$("${TIMEOUT_CMD[@]}" bluetoothctl info "$BT_ADDR" 2>/dev/null)
+            [[ "$bt_info" =~ Battery\ Percentage:\ 0x[0-9A-Fa-f]+\ \(([0-9]+)\) ]] && BT_BATTERY="${BASH_REMATCH[1]}"
+        fi
+    fi
+    return 0
+}
+
+debug_dump() {
+    (( DEBUG )) || return 0
+    local i j
+    say "  ${DIM}[DEBUG] Server: ${SERVER_NAME} ${SERVER_VERSION}${NC}"
+    say "  ${DIM}[DEBUG] Default Source: ${DEFAULT_SOURCE}  (Index ${CUR_SRC})${NC}"
+    say "  ${DIM}[DEBUG] Default Sink:   ${DEFAULT_SINK}  (Index ${CUR_SINK})${NC}"
+    for i in "${!SRC_NAME[@]}"; do
+        say "  ${DIM}[DEBUG] SRC  ${SRC_TYPE[i]}  ${SRC_KEY[i]}  ${SRC_NAME[i]}  vol=${SRC_VOL[i]} mute=${SRC_MUTE[i]} codec=${SRC_CODEC[i]}${NC}"
+    done
+    for i in "${!SINK_NAME[@]}"; do
+        say "  ${DIM}[DEBUG] SINK ${SINK_TYPE[i]}  ${SINK_KEY[i]}  ${SINK_NAME[i]}  vol=${SINK_VOL[i]} mute=${SINK_MUTE[i]} port=${SINK_PORT[i]}${NC}"
+    done
+    for i in "${!CARD_NAME[@]}"; do
+        j="${CARD_BEST_MIC[i]}"
+        say "  ${DIM}[DEBUG] CARD ${CARD_KEY[i]}  ${CARD_NAME[i]}  aktiv=${CARD_ACTIVE[i]}  bestes-Mic-Profil=${j:+${PROF_NAME[j]}}${NC}"
+        for j in "${!PROF_NAME[@]}"; do
+            (( PROF_CARD[j] == i )) || continue
+            say "  ${DIM}[DEBUG]      ${PROF_NAME[j]}: codec=${PROF_CODEC[j]:-?} sources=${PROF_SOURCES[j]} available=${PROF_AVAIL[j]}${NC}"
+        done
+    done
+    say "  ${DIM}[DEBUG] BT: key=${BT_KEY} card=${BT_CARD} codec=${BT_CODEC} akku=${BT_BATTERY}${NC}"
+    say ""
+}
+
+# ━━━ ANZEIGE: KOPF ━━━
+vol_label() {   # $1 = Lautstärke %, $2 = Mute → REPLY
+    if [[ "$2" == yes ]]; then
+        REPLY="${BG_RED}${BOLD} STUMM ${NC}"
+    elif (( ${1:-0} < 20 )); then
+        REPLY="${YELLOW}${1}%${NC}"
+    else
+        REPLY="${GREEN}${1}%${NC}"
+    fi
+}
+
+bt_extra() {   # Codec · kHz · Akku (REPLY)
+    local s="" j col
+    if [[ -n "$BT_CODEC" ]]; then
+        col="$GREEN"
+        [[ "$BT_CODEC" == CVSD ]] && col="$RED"
+        if [[ "$BT_ROLE" == out ]] && (( BT_CARD >= 0 )); then
+            # Ausgabe im Musik-Modus: kein Mikrofon verfügbar
+            profile_index "$BT_CARD" "${CARD_ACTIVE[BT_CARD]}"; j=$REPLY
+            if (( j >= 0 && PROF_SOURCES[j] == 0 )); then col="$YELLOW"; fi
+        fi
+        s+="  ${DIM}·${NC} Codec: ${col}${BT_CODEC}${NC}"
+        codec_khz "$BT_CODEC"
+        [[ -n "$REPLY" && "$BT_ROLE" == mic ]] && s+=" ${DIM}${REPLY}${NC}"
+    fi
+    if [[ -n "$BT_BATTERY" ]]; then
+        col="$GREEN"
+        (( BT_BATTERY < BATTERY_WARN )) && col="$RED"
+        s+="  ${DIM}·${NC} ${I_BAT} ${col}${BT_BATTERY}%${NC}"
+    fi
+    REPLY="$s"
+}
+
+bt_profiles_line() {   # kompakte Profil-Übersicht der aktiven BT-Karte
+    (( BT_CARD >= 0 )) || return 0
+    local j item headset="" music=""
+    for j in "${!PROF_NAME[@]}"; do
+        (( PROF_CARD[j] == BT_CARD )) || continue
+        [[ "${PROF_NAME[j]}" == off || "${PROF_AVAIL[j]}" == no ]] && continue
+        item="${PROF_CODEC[j]:-${PROF_NAME[j]}}"
+        if [[ "${PROF_NAME[j]}" == "${CARD_ACTIVE[BT_CARD]}" ]]; then
+            item="${NC}${CYAN}${item} (aktiv)${NC}${DIM}"
+        fi
+        if (( PROF_SOURCES[j] > 0 )); then
+            headset+="${headset:+, }${item}"
+        else
+            music+="${music:+, }${item}"
+        fi
+    done
+    [[ -z "$headset$music" ]] && return 0
+    local line="  ${DIM}BT-Profile:"
+    [[ -n "$headset" ]] && line+="  ${I_HEADSET}: ${headset}"
+    [[ -n "$headset" && -n "$music" ]] && line+="  ${SEP}"
+    [[ -n "$music" ]] && line+="  ${I_MUSIC}: ${music}"
+    say "${line}${NC}"
+}
+
+print_header() {
+    local keep="" extra tl c
+    (( KEEP_DEVICES )) && keep=" ${DIM}(--keep)${NC}"
+    (( ROUTING_LOCKED && !KEEP_DEVICES )) && keep=" ${DIM}(manuell gewählt)${NC}"
+    say "  ${BOLD}${I_TITLE}${NC}${keep} ${DIM}v${VERSION}${NC} ─── ${DIM}${AUDIO_SRV}${NC}"
+
+    extra=""
+    if (( CUR_SRC >= 0 )); then
+        [[ "$BT_ROLE" == mic ]] && { bt_extra; extra="$REPLY"; }
+        type_label "${SRC_TYPE[CUR_SRC]}"; tl="$REPLY"
+        vol_label "${SRC_VOL[CUR_SRC]}" "${SRC_MUTE[CUR_SRC]}"
+        say "  ${I_MIC} Mic: ${BOLD}${MIC_DESC:0:42}${NC} ${DIM}[${NC}${tl}${DIM}]${NC} ${REPLY}${extra}"
+    else
+        say "  ${I_MIC} Mic: ${RED}kein Mikrofon gefunden${NC}"
+    fi
+
+    extra=""
+    if (( CUR_SINK >= 0 )); then
+        [[ "$BT_ROLE" == out ]] && { bt_extra; extra="$REPLY"; }
+        type_label "${SINK_TYPE[CUR_SINK]}"; tl="$REPLY"
+        vol_label "${SINK_VOL[CUR_SINK]}" "${SINK_MUTE[CUR_SINK]}"
+        say "  ${I_OUT} Out: ${BOLD}${OUT_DESC:0:42}${NC} ${DIM}[${NC}${tl}${DIM}]${NC} ${REPLY}${extra}"
+    else
+        say "  ${I_OUT} Out: ${RED}keine Ausgabe gefunden${NC}"
+    fi
+
+    bt_profiles_line
+
+    # Was beim letzten Durchlauf umgeschaltet wurde
+    for c in "${CHANGES[@]}"; do
+        say "  ${GREEN}${I_REDO}${NC} ${c}"
+    done
+    CHANGES=()
+    say ""
+}
+
+# ━━━ UMSCHALTEN ━━━
+switch_to_source() {   # $1 = Index der Quelle; Ausgabe desselben Geräts wird mitgenommen
+    local i=$1 j
+    say "  ${DIM}Setze Mikrofon → ${SRC_DESC[i]}${NC}"
+    if ! pactl set-default-source "${SRC_NAME[i]}" 2>/dev/null; then
+        say "  ${RED}${I_FAIL}${NC} Umschalten fehlgeschlagen"
+        return 1
+    fi
+    CHANGES+=("Mikrofon → ${SRC_DESC[i]}")
+    sink_for_key "${SRC_KEY[i]}"; j=$REPLY
+    if (( j >= 0 )) && [[ "${SINK_NAME[j]}" != "$DEFAULT_SINK" ]]; then
+        say "  ${DIM}Setze Ausgabe  → ${SINK_DESC[j]}${NC}"
+        pactl set-default-sink "${SINK_NAME[j]}" 2>/dev/null && CHANGES+=("Ausgabe → ${SINK_DESC[j]}")
+    fi
+    return 0
+}
+
+bt_node_name() {   # $1 = sources|sinks, $2 = BT-Adresse → REPLY = Node-Name
+    local a="${2,,}" au
+    au="${a//:/_}"
+    REPLY=$(pactl list "$1" short 2>/dev/null | awk -v a="$a" -v au="$au" '
+        { n = tolower($2) }
+        n ~ /bluez/ && n !~ /\.monitor$/ && n !~ /capture_internal/ && (index(n, au) || index(n, a)) { print $2; exit }')
+}
+
+switch_bt_profile() {   # $1 = Karte, $2 = Profil-Index → setzt Profil + Defaults
+    local c=$1 j=$2 t
+    local codec="${PROF_CODEC[j]:-${PROF_NAME[j]}}"
+    say "  ${DIM}Setze BT-Profil system-weit → ${PROF_NAME[j]} (${codec})…${NC}"
+    if ! pactl set-card-profile "${CARD_NAME[c]}" "${PROF_NAME[j]}" 2>/dev/null; then
+        say "  ${RED}${I_FAIL}${NC} Profilwechsel fehlgeschlagen"
+        return 1
+    fi
+    CHANGES+=("Bluetooth-Profil → Headset · ${codec}")
+
+    # Warten, bis das Headset-Mikrofon erscheint (statt fester Pause)
+    REPLY=""
+    if [[ -n "${CARD_ADDR[c]}" ]]; then
+        for (( t = 0; t < 30; t++ )); do
+            bt_node_name sources "${CARD_ADDR[c]}"
+            [[ -n "$REPLY" ]] && break
+            sleep 0.2
+        done
+    fi
+    if [[ -z "$REPLY" ]]; then
+        say "  ${YELLOW}${I_WARN}${NC} Profil gewechselt, aber das Headset-Mikrofon ist noch nicht erschienen."
+        return 0
+    fi
+    pactl set-default-source "$REPLY" 2>/dev/null && CHANGES+=("Mikrofon → ${CARD_DESC[c]}")
+    bt_node_name sinks "${CARD_ADDR[c]}"
+    [[ -n "$REPLY" ]] && pactl set-default-sink "$REPLY" 2>/dev/null
+    return 0
+}
+
+# ━━━ SMART ROUTING ━━━
+# Setzt REDETECT=1, wenn etwas umgeschaltet wurde (dann neu erkennen).
+smart_routing() {
+    local cur_type="none" cur_key="" i c j tn tl best_kind="" best_ref=-1 best_rank
+    if (( CUR_SRC >= 0 )); then
+        cur_type="${SRC_TYPE[CUR_SRC]}"; cur_key="${SRC_KEY[CUR_SRC]}"
+    fi
+    if [[ "$cur_type" == virtual ]]; then
+        say "  ${DIM}${I_INFO} Virtuelle Quelle aktiv (z.B. Rauschfilter/EasyEffects) – keine automatische Umschaltung.${NC}"
+        say ""
+        return 0
+    fi
+    src_rank "$cur_type"; best_rank=$REPLY
+
+    # --- 1) Besseres Mikrofon verfügbar? (USB > BT > Webcam > Intern) ---
+    for i in "${!SRC_NAME[@]}"; do
+        [[ "${SRC_KEY[i]}" == "$cur_key" ]] && continue
+        is_skipped "${SRC_KEY[i]}" && continue
+        src_rank "${SRC_TYPE[i]}"
+        (( REPLY > best_rank )) || continue
+        best_kind="src"; best_ref=$i; best_rank=$REPLY
+    done
+    # Bluetooth-Headset im Musik-Modus (A2DP): Mikrofon erst nach Profilwechsel
+    for c in "${!CARD_NAME[@]}"; do
+        [[ "${CARD_KEY[c]}" == bt:* && -n "${CARD_BEST_MIC[c]}" ]] || continue
+        [[ "${CARD_KEY[c]}" == "$cur_key" ]] && continue
+        is_skipped "${CARD_KEY[c]}" && continue
+        source_for_key "${CARD_KEY[c]}"
+        (( REPLY >= 0 )) && continue
+        (( 3 > best_rank )) || continue
+        best_kind="card"; best_ref=$c; best_rank=3
+    done
+
+    if [[ "$best_kind" == src ]]; then
+        type_name "${SRC_TYPE[best_ref]}"; tn="$REPLY"
+        type_name "$cur_type"
+        say "  ${GREEN}${I_DOT}${NC} ${tn} erkannt: ${BOLD}${SRC_DESC[best_ref]}${NC}"
+        say "    ${DIM}Aktuell: ${REPLY}${NC}"
+        if ask_yn "Auf ${tn} umschalten (Mic + Ausgabe)?"; then
+            say ""
+            switch_to_source "$best_ref" && { REDETECT=1; return 0; }
+        else
+            DECLINED[${SRC_KEY[best_ref]}]=1
+        fi
+        say ""
+    elif [[ "$best_kind" == card ]]; then
+        j="${CARD_BEST_MIC[best_ref]}"
+        local codec="${PROF_CODEC[j]:-HFP}"
+        if (( CUR_SINK >= 0 )) && [[ "${SINK_KEY[CUR_SINK]}" == "${CARD_KEY[best_ref]}" ]]; then
+            # Headset läuft gerade als Ausgabe im Musik-Modus → automatisch mit Countdown
+            say "  ${YELLOW}${I_WARN}${NC} ${BOLD}${CARD_DESC[best_ref]}${NC} ist im Musik-Modus (A2DP${BT_CODEC:+, $BT_CODEC}) – kein Mikrofon aktiv."
+            if countdown "Wechsle auf Headset · ${codec}" 3; then
+                switch_bt_profile "$best_ref" "$j" && { REDETECT=1; return 0; }
+            else
+                DECLINED[${CARD_KEY[best_ref]}]=1
+            fi
+        else
+            say "  ${CYAN}${I_DOT}${NC} Bluetooth-Headset erkannt: ${BOLD}${CARD_DESC[best_ref]}${NC} ${DIM}(Musik-Modus)${NC}"
+            if ask_yn "Auf Bluetooth-Headset umschalten (Headset · ${codec})?"; then
+                say ""
+                switch_bt_profile "$best_ref" "$j" && { REDETECT=1; return 0; }
+            else
+                DECLINED[${CARD_KEY[best_ref]}]=1
+            fi
+        fi
+        say ""
+    fi
+
+    # --- 2) Bluetooth-Mikrofon: besseren Headset-Codec wählen (z.B. CVSD → mSBC) ---
+    if [[ "$cur_type" == bluetooth ]] && (( BT_CARD >= 0 )) && [[ -z "${DECLINED[codec:$cur_key]:-}" ]]; then
+        j="${CARD_BEST_MIC[BT_CARD]}"
+        if [[ -n "$j" && "${PROF_NAME[j]}" != "${CARD_ACTIVE[BT_CARD]}" ]]; then
+            local act_rank target="${PROF_CODEC[j]:-${PROF_NAME[j]}}"
+            mic_rank "$BT_CODEC"; act_rank=$REPLY
+            mic_rank "${PROF_CODEC[j]}"
+            if (( REPLY > act_rank )); then
+                if [[ "$BT_CODEC" == CVSD ]]; then
+                    say "  ${YELLOW}${I_WARN}${NC} CVSD hat niedrige Qualität (8 kHz). ${target} ist verfügbar."
+                else
+                    say "  ${YELLOW}${I_WARN}${NC} Headset-Profil nicht optimal (${BT_CODEC:-?}). ${target} ist verfügbar."
+                fi
+                if countdown "Wechsle zu Headset · ${target}" 3; then
+                    switch_bt_profile "$BT_CARD" "$j" && { REDETECT=1; return 0; }
+                else
+                    DECLINED[codec:$cur_key]=1
+                fi
+                say ""
+            fi
+        fi
+    fi
+
+    # --- 3) Ausgabe passend zum Headset, wenn sie auf Lautsprecher/HDMI läuft ---
+    if [[ "$cur_type" == usb || "$cur_type" == bluetooth ]]; then
+        local st="none"
+        (( CUR_SINK >= 0 )) && st="${SINK_TYPE[CUR_SINK]}"
+        if [[ "$st" == internal || "$st" == hdmi || "$st" == none ]]; then
+            sink_for_key "$cur_key"; j=$REPLY
+            if (( j >= 0 )); then
+                type_label "$cur_type"; tl="$REPLY"
+                type_label "$st"
+                say "  ${YELLOW}${I_WARN}${NC}  Mikrofon ist ${tl}, aber Ausgabe ist ${REPLY}"
+                say "  ${DIM}Korrigiere Ausgabe → ${SINK_DESC[j]}${NC}"
+                if pactl set-default-sink "${SINK_NAME[j]}" 2>/dev/null; then
+                    CHANGES+=("Ausgabe → ${SINK_DESC[j]} (passend zum Mikrofon)")
+                    REDETECT=1
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    return 0
+}
+
+# Bestes anderes Mikrofon (für "kein Signal") → REPLY_KIND / REPLY_REF
+best_alternative() {
+    local i c cur_key="" best_rank=0
+    REPLY_KIND=""; REPLY_REF=-1
+    (( CUR_SRC >= 0 )) && cur_key="${SRC_KEY[CUR_SRC]}"
+    for i in "${!SRC_NAME[@]}"; do
+        [[ "${SRC_KEY[i]}" == "$cur_key" || "${SRC_TYPE[i]}" == virtual ]] && continue
+        [[ -n "${NOSIG_TRIED[${SRC_KEY[i]}]:-}" ]] && continue
+        src_rank "${SRC_TYPE[i]}"
+        (( REPLY > best_rank )) || continue
+        REPLY_KIND="src"; REPLY_REF=$i; best_rank=$REPLY
+    done
+    for c in "${!CARD_NAME[@]}"; do
+        [[ "${CARD_KEY[c]}" == bt:* && -n "${CARD_BEST_MIC[c]}" ]] || continue
+        [[ "${CARD_KEY[c]}" == "$cur_key" || -n "${NOSIG_TRIED[${CARD_KEY[c]}]:-}" ]] && continue
+        source_for_key "${CARD_KEY[c]}"
+        (( REPLY >= 0 )) && continue
+        (( 3 > best_rank )) || continue
+        REPLY_KIND="card"; REPLY_REF=$c; best_rank=3
+    done
+}
+
+# ━━━ STUMM / LAUTSTÄRKE ━━━
+check_mic_state() {   # 0 = weiter, 1 = Mikrofon bleibt stumm
+    if [[ "${SRC_MUTE[CUR_SRC]}" == yes ]]; then
+        say "  ${RED}${BOLD}${I_FAIL} Mikrofon ist stumm!${NC}"
+        if ask_yn "Jetzt einschalten?"; then
+            if pactl set-source-mute @DEFAULT_SOURCE@ 0 2>/dev/null; then
+                SRC_MUTE[CUR_SRC]="no"
+                say "  ${GREEN}${I_OK}${NC} Mikrofon eingeschaltet"
+                say ""
+            else
+                add_issue fail mic "Mikrofon ist stumm (Einschalten fehlgeschlagen)" "pactl set-source-mute @DEFAULT_SOURCE@ 0"
+                return 1
+            fi
+        else
+            add_issue fail mic "Mikrofon ist stumm" "pactl set-source-mute @DEFAULT_SOURCE@ 0"
+            return 1
+        fi
+    fi
+    if (( ${SRC_VOL[CUR_SRC]:-0} < 10 )); then
+        say "  ${YELLOW}${I_WARN}${NC} Mikrofon-Lautstärke ist nur ${SRC_VOL[CUR_SRC]}%."
+        if ask_yn "Auf 100% setzen?" && pactl set-source-volume @DEFAULT_SOURCE@ 100% 2>/dev/null; then
+            SRC_VOL[CUR_SRC]=100
+            say "  ${GREEN}${I_OK}${NC} Mikrofon-Lautstärke auf 100%"
+        fi
+        say ""
+    fi
+    return 0
+}
+
+# ━━━ PEGELANZEIGE ━━━
+build_meter() {   # $1 = Zeichen, $2 = Peak-Hold-Zeichen (-1 = keins), $3 = Farbe → METER
+    local lvl=$1 hold=$2 i s="$3" zone=0
+    for (( i = 0; i < lvl; i++ )); do s+="$BAR_FULL"; done
+    s+="$NC"
+    for (( i = lvl; i < BAR_W; i++ )); do
+        if (( i >= ZONE_START && i <= ZONE_END )); then
+            (( zone )) || { s+="$DIM"; zone=1; }
+        elif (( zone )); then
+            s+="$NC"; zone=0
+        fi
+        if (( i == hold )); then
+            s+="${NC}${BOLD}${BAR_PEAK}${NC}"
+            (( zone )) && s+="$DIM"
+        elif (( zone )); then
+            s+="$BAR_ZONE"
+        else
+            s+="$BAR_EMPTY"
+        fi
+    done
+    s+="$NC"
+    METER="[${s}]"
+}
+
+level_color() {   # $1 = Zeichen → REPLY (gelb = zu leise, grün = Zielzone, rot = zu laut)
+    if (( $1 < ZONE_START )); then REPLY="$YELLOW"
+    elif (( $1 > ZONE_END )); then REPLY="$RED"
+    else REPLY="$GREEN"; fi
+}
+
+fmt_db() { if [[ "$1" == "-99.0" ]]; then REPLY="-inf"; else REPLY="$1"; fi; }
+
+meter_line() {   # $1 = Label, $2 = Zeichen, $3 = Hold, $4 = dB, $5 = Status, $6 = live
+    # Live-Aktualisierungen nur im Terminal (nicht in Pipes/Logs)
+    [[ "${6:-}" == live ]] && (( !IS_TTY )) && return 0
+    level_color "$2"
+    build_meter "$2" "$3" "$REPLY"
+    fmt_db "$4"
+    printf '\r  %s %s %6s dB  %s%s' "$1" "$METER" "$REPLY" "$5" "$EL"
+}
+
+# ━━━ AUFNAHME ━━━
+CHUNK_AWK='
+{ for (i = 1; i <= NF; i++) { v = $i + 0; if (v < 0) v = -v; if (v > m) m = v; s += v * v; n++; if (v >= 32767) c++ } }
+END {
+    db = (m > 0) ? 20 * log(m / 32768) / log(10) : -99
+    l = int((db - F) / (-F) * W); if (l < 0) l = 0; if (l > W) l = W
+    printf "%d %.0f %d %d %.1f %d\n", m, s, n, c, db, l
+}'
+
+read_chunk() {   # liest genau einen Block vom Aufnahme-Stream (fd 3)
+    # iflag=fullblock: ohne liefert dd aus einer Pipe oft nur Teilblöcke.
+    # timeout: hängt das Gerät, kommt nach 5 s ein Fehler statt Stillstand.
+    "${TIMEOUT_CMD[@]}" dd bs="$CHUNK_BYTES" count=1 iflag=fullblock of="$CHUNK" <&3 2>/dev/null
+    [[ -s "$CHUNK" ]] || return 1
+    read -r CH_PEAK CH_SUMSQ CH_N CH_CLIP CH_DB CH_LVL < <(
+        od -An -td2 -v "$CHUNK" | awk -v W="$BAR_W" -v F="$DB_FLOOR" "$CHUNK_AWK")
+    (( CH_N > 0 ))
+}
+
+stop_rec() {
+    [[ -n "${REC_PID:-}" ]] && kill "$REC_PID" 2>/dev/null
+    exec 3<&-
+    [[ -n "${REC_PID:-}" ]] && wait "$REC_PID" 2>/dev/null
+    REC_PID=""
+}
+
+rec_failed() {
+    stop_rec
+    local err
+    err=$(grep -v '^[[:space:]]*$' "$REC_ERR" 2>/dev/null | head -2 | tr '\n' ' ')
+    err="${err% }"
+    printf '\n'
+    add_issue fail mic "Aufnahme fehlgeschlagen${err:+: ${err}}" "Gerät belegt oder getrennt? ./mic-check.sh --debug"
+}
+
+ms_to_db() {   # Summe der Quadrate, Anzahl → RMS in dBFS (REPLY)
+    REPLY=$(awk -v s="$1" -v n="$2" \
+        'BEGIN { if (n <= 0 || s <= 0) print "-99.0"; else printf "%.1f", 10 * log(s / n / 1073741824) / log(10) }')
+}
+
+push_chunk() {   # aktuellen Block an die Aufnahme-Arrays anhängen
+    REC_PEAK+=("$CH_PEAK"); REC_SUMSQ+=("$CH_SUMSQ"); REC_N+=("$CH_N")
+    REC_CLIP+=("$CH_CLIP"); REC_LVL+=("$CH_LVL"); REC_DBS+=("$CH_DB")
+}
+
+# Ein einziger rec-Stream für Rauschboden, Warten und Sprachaufnahme:
+# kein Neustart des Geräts zwischen den Phasen, die erste Silbe bleibt erhalten.
+measure() {
+    local cps=$CHUNKS_PER_SEC i k
+    local skip=$(( cps * 3 / 10 )) noise_n=$(( NOISE_SECS * cps ))
+    local wait_n=$(( WAIT_SECS * cps )) rec_n=$(( CHECK_SECS * cps ))
+    local total=$(( NOISE_SECS + WAIT_SECS + CHECK_SECS + 2 ))
+    REC_PEAK=(); REC_SUMSQ=(); REC_N=(); REC_CLIP=(); REC_LVL=(); REC_DBS=()
+    local -a w_peak=() w_sumsq=() w_n=() w_clip=() w_lvl=() w_db=()
+    NOISE_SUMSQ=0; NOISE_N=0; NOISE_PEAK=0
+    : > "$FILE"; : > "$WAIT_FILE"
+    rm -f "$REC_FIFO"
+    if ! mkfifo "$REC_FIFO"; then
+        add_issue fail mic "Interner Fehler (mkfifo)" ""
+        return 1
+    fi
+
+    # --- Rauschboden ---
+    printf '  %s Rauschboden %s(bitte 1 s still sein…)%s: ' "$I_HUSH" "$DIM" "$NC"
+    rec -q -c "$CHANNELS" -r "$RATE" -b "$BITS" -e signed-integer -t raw - \
+        trim 0 "$total" 2>"$REC_ERR" >"$REC_FIFO" &
+    REC_PID=$!
+    exec 3<"$REC_FIFO"
+
+    # Die ersten 0.3 s verwerfen (Einschalt-Knacken, v.a. bei Bluetooth)
+    for (( i = 0; i < skip; i++ )); do read_chunk || { rec_failed; return 1; }; done
+    for (( i = 0; i < noise_n; i++ )); do
+        read_chunk || { rec_failed; return 1; }
+        (( NOISE_SUMSQ += CH_SUMSQ, NOISE_N += CH_N ))
+        (( CH_PEAK > NOISE_PEAK )) && NOISE_PEAK=$CH_PEAK
+    done
+    ms_to_db "$NOISE_SUMSQ" "$NOISE_N"; NOISE_DB="$REPLY"
+    if [[ "$NOISE_DB" == "-99.0" ]]; then
+        say "${GREEN}kein Rauschen${NC} ${DIM}(digitale Stille)${NC}"
+    elif flt "$NOISE_DB" "$NOISE_GOOD"; then
+        say "${GREEN}${NOISE_DB} dB${NC} ${DIM}(sehr gut)${NC}"
+    elif flt "$NOISE_DB" "$NOISE_OK"; then
+        say "${YELLOW}${NOISE_DB} dB${NC} ${DIM}(akzeptabel)${NC}"
+    else
+        say "${RED}${NOISE_DB} dB${NC} ${DIM}(hoch)${NC}"
+    fi
+
+    # --- Warten auf Sprache (Schwelle relativ zum Rauschboden, ~+10 dB) ---
+    local thr=$(( NOISE_PEAK * 3 ))
+    (( thr < 400 )) && thr=400
+    (( thr > 8000 )) && thr=8000
+    # shellcheck disable=SC1111  # deutsche Anführungszeichen
+    say "  ${I_SAY} Sprich jetzt, z.B.: ${BOLD}„${READ_PROMPT}“${NC}"
+    local triggered=0
+    for (( i = 0; i < wait_n; i++ )); do
+        read_chunk || { rec_failed; return 1; }
+        cat "$CHUNK" >> "$WAIT_FILE"
+        w_peak+=("$CH_PEAK"); w_sumsq+=("$CH_SUMSQ"); w_n+=("$CH_N")
+        w_clip+=("$CH_CLIP"); w_lvl+=("$CH_LVL"); w_db+=("$CH_DB")
+        meter_line "${I_MIC} INPUT " "$CH_LVL" -1 "$CH_DB" \
+            "${DIM}warte auf Sprache… $(( (wait_n - i + cps - 1) / cps ))s${NC}" live
+        if (( CH_PEAK > thr )); then triggered=1; break; fi
+    done
+
+    # Vorlauf (Block vor dem Auslöser + Auslöser) bzw. bei Timeout die letzten
+    # CHECK_SECS der Wartezeit als Aufnahme verwenden (z.B. sehr leises Mikro)
+    local n_w=${#w_peak[@]} start
+    if (( triggered )); then
+        start=$(( n_w >= 2 ? n_w - 2 : 0 ))
+    else
+        start=$(( n_w > rec_n ? n_w - rec_n : 0 ))
+    fi
+    for (( k = start; k < n_w; k++ )); do
+        REC_PEAK+=("${w_peak[k]}"); REC_SUMSQ+=("${w_sumsq[k]}"); REC_N+=("${w_n[k]}")
+        REC_CLIP+=("${w_clip[k]}"); REC_LVL+=("${w_lvl[k]}"); REC_DBS+=("${w_db[k]}")
+    done
+    tail -c $(( (n_w - start) * CHUNK_BYTES )) "$WAIT_FILE" > "$FILE"
+
+    # --- Sprachaufnahme ---
+    if (( triggered )); then
+        local hold=0
+        for k in "${REC_LVL[@]}"; do (( k > hold )) && hold=$k; done
+        while (( ${#REC_PEAK[@]} < rec_n )); do
+            read_chunk || break
+            cat "$CHUNK" >> "$FILE"
+            push_chunk
+            (( CH_LVL > hold )) && hold=$CH_LVL
+            meter_line "${I_MIC} INPUT " "$CH_LVL" "$hold" "$CH_DB" \
+                "${RED}${I_REC}${NC} $(( (rec_n - ${#REC_PEAK[@]} + cps - 1) / cps ))s" live
+        done
+    fi
+    stop_rec
+    return 0
+}
+
+# ━━━ AUSWERTUNG ━━━
+analyze() {
+    local k maxp=0 clips=0 as=0 an=0 ts=0 tn=0 ms noise_ms=0
+    (( NOISE_N > 0 )) && noise_ms=$(( NOISE_SUMSQ / NOISE_N ))
+    for k in "${!REC_PEAK[@]}"; do
+        (( REC_PEAK[k] > maxp )) && maxp=${REC_PEAK[k]}
+        (( clips += REC_CLIP[k], ts += REC_SUMSQ[k], tn += REC_N[k] ))
+        (( REC_N[k] > 0 )) || continue
+        ms=$(( REC_SUMSQ[k] / REC_N[k] ))
+        # Sprach-Blöcke: > Rauschboden + 6 dB und > -50 dBFS RMS
+        if (( ms > 4 * noise_ms && ms > 10737 )); then
+            (( as += REC_SUMSQ[k], an += REC_N[k] ))
+        fi
+    done
+    (( an == 0 )) && { as=$ts; an=$tn; }
+    MAX_PEAK=$maxp
+    CLIP_COUNT=$clips
+    # SNR = Sprach-RMS minus Rausch-RMS (robuster als Peak/Peak)
+    read -r PEAK_DB _ SNR_DB < <(awk -v p="$maxp" -v s="$as" -v n="$an" -v nd="$NOISE_DB" 'BEGIN {
+        pk = (p > 0) ? 20 * log(p / 32768) / log(10) : -99
+        sp = (n > 0 && s > 0) ? 10 * log(s / n / 1073741824) / log(10) : -99
+        snr = sp - nd; if (snr > 99) snr = 99
+        printf "%.1f %.1f %.1f\n", pk, sp, snr }')
+    db_cells "$PEAK_DB"; PEAK_LVL=$REPLY
+}
+
+suggest_gain() {   # GAIN_NEW_PCT für die Zielzone (Lautstärke-% ist kubisch skaliert)
+    GAIN_NEW_PCT=""
+    local cur="${SRC_VOL[CUR_SRC]:-100}" delta new
+    if [[ "$LEVEL_STATE" == clip ]]; then
+        delta=$(( LVL_TARGET - 3 ))   # wahrer Peak unbekannt (≥ 0 dB)
+    else
+        delta=$(awk -v t="$LVL_TARGET" -v p="$PEAK_DB" 'BEGIN { printf "%.1f", t - p }')
+    fi
+    new=$(awk -v c="$cur" -v d="$delta" -v mx="$MAX_GAIN_PCT" \
+        'BEGIN { n = c * 10 ^ (d / 60); if (n > mx) n = mx; if (n < 5) n = 5; printf "%d", n + 0.5 }')
+    (( new != cur )) && GAIN_NEW_PCT=$new
+}
+
+evaluate_level() {
+    HAVE_SIGNAL=0; LEVEL_STATE=""
+    local mark hint
+    if flt "$PEAK_DB" "$LVL_NO_SIGNAL"; then
+        LEVEL_STATE="none"
+        SNR_DB=""
+        meter_line "${I_MIC} INPUT " "$PEAK_LVL" -1 "$PEAK_DB" "${RED}${I_FAIL} kein Signal${NC}"
+        printf '\n'
+        fmt_db "$PEAK_DB"
+        add_issue fail mic "Kein Signal – das Mikrofon empfängt nichts (Peak ${REPLY} dB)" \
+            "Kabel · Mute-Taste am Headset · anderes Gerät → [d]"
+        return
+    fi
+    HAVE_SIGNAL=1
+    if (( CLIP_COUNT >= 3 )) || ! flt "$PEAK_DB" "$LVL_CLIP"; then
+        LEVEL_STATE="clip"; mark="${YELLOW}${I_WARN} übersteuert${NC}"
+    elif flt "$PEAK_DB" "$LVL_QUIET"; then
+        LEVEL_STATE="quiet"; mark="${YELLOW}${I_WARN} zu leise${NC}"
+    else
+        LEVEL_STATE="ok"; mark="${GREEN}${I_OK}${NC}"
+    fi
+    meter_line "${I_MIC} INPUT " "$PEAK_LVL" -1 "$PEAK_DB" "$mark"
+    printf '\n'
+
+    [[ "$LEVEL_STATE" == clip || "$LEVEL_STATE" == quiet ]] || return
+    suggest_gain
+    if [[ -n "$GAIN_NEW_PCT" ]]; then
+        hint="Mic-Gain ${SRC_VOL[CUR_SRC]}% → ${GAIN_NEW_PCT}% → [g]"
+    elif [[ "$LEVEL_STATE" == quiet ]]; then
+        hint="Mic-Gain ist am Maximum – Mikrofon näher an den Mund"
+    else
+        hint="Mikrofon weiter weg oder leiser sprechen"
+    fi
+    if [[ "$LEVEL_STATE" == clip ]]; then
+        add_issue warn level "Übersteuert (Peak ${PEAK_DB} dB, ${CLIP_COUNT} Samples geclippt)" "$hint"
+    else
+        add_issue warn level "Sehr leise (Peak ${PEAK_DB} dB)" "$hint"
+    fi
+}
+
+evaluate_quality() {
+    SNR_RATING=""
+    if flt "$SNR_DB" "$SNR_OK"; then
+        SNR_RATING="schlecht"
+        add_issue warn noise "Hintergrundgeräusche zu laut (SNR ${SNR_DB} dB)" \
+            "ruhigerer Ort · Mikro näher · Rauschfilter (z.B. EasyEffects/NoiseTorch)"
+    elif flt "$SNR_DB" "$SNR_GOOD"; then
+        SNR_RATING="akzeptabel"
+    elif flt "$SNR_DB" "$SNR_EXCELLENT"; then
+        SNR_RATING="gut"
+    else
+        SNR_RATING="exzellent"
+    fi
+}
+
+check_bandwidth() {   # Energie über 4.5 kHz relativ zu 1–4 kHz (CVSD schneidet bei 4 kHz ab)
+    BW_STATE=""
+    (( RATE >= 16000 )) || return 0
+    local -a fmt=(-t raw -r "$RATE" -c "$CHANNELS" -b "$BITS" -e signed-integer)
+    local mid hi hint
+    mid=$(sox "${fmt[@]}" "$FILE" -n sinc 1000-4000 stats 2>&1 | awk '/^RMS lev dB/ { print $4 }')
+    hi=$(sox "${fmt[@]}" "$FILE" -n sinc 4500-7500 stats 2>&1 | awk '/^RMS lev dB/ { print $4 }')
+    [[ "$mid" =~ ^-?[0-9.]+$ ]] || return 0
+    [[ "$hi" =~ ^-?[0-9.]+$ ]] || hi=-200
+    BW_DIFF=$(awk -v h="$hi" -v m="$mid" 'BEGIN { printf "%.0f", h - m }')
+    if ! flt "$BW_DIFF" "$BW_MIN_DB"; then
+        BW_STATE="wide"
+        return 0
+    fi
+    BW_STATE="narrow"
+    hint="Zischlaute (s, sch) sprechen oder Mikrofon prüfen"
+    if (( CUR_SRC >= 0 )) && [[ "${SRC_TYPE[CUR_SRC]}" == bluetooth ]]; then
+        if [[ "$BT_CODEC" == CVSD ]]; then
+            hint="CVSD-Codec begrenzt auf 4 kHz – Headset-Profil mit mSBC wählen"
+        else
+            hint="Bluetooth-Codec/Profil prüfen"
+        fi
+    fi
+    add_issue warn bw "Schmalband (≤4 kHz) – klingt dumpf wie am Telefon" "$hint"
+}
+
+# ━━━ WIEDERGABE ━━━
+play_with_meter() {   # $1 = Status während der Wiedergabe → 0 = ok
+    local k n=${#REC_LVL[@]} t
+    sox -q -t raw -r "$RATE" -c "$CHANNELS" -b "$BITS" -e signed-integer "$FILE" -d 2>"$PLAY_ERR" &
+    PLAY_PID=$!
+    # Anzeige im Takt der Wiedergabe aus den gespeicherten Aufnahme-Blöcken
+    for (( k = 0; k < n; k++ )); do
+        meter_line "${I_OUT} OUTPUT" "${REC_LVL[k]}" -1 "${REC_DBS[k]}" "$1" live
+        kill -0 "$PLAY_PID" 2>/dev/null || break
+        sleep "$CHUNK_SECS"
+    done
+    # Hängt die Ausgabe, nicht ewig warten
+    for (( t = 0; t < 30; t++ )); do
+        kill -0 "$PLAY_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -0 "$PLAY_PID" 2>/dev/null && { kill "$PLAY_PID" 2>/dev/null; echo "Zeitüberschreitung" >> "$PLAY_ERR"; }
+    wait "$PLAY_PID"
+    k=$?
+    PLAY_PID=""
+    return $k
+}
+
+playback() {
+    (( NO_PLAYBACK )) && return 0
+    (( HAVE_SIGNAL )) && [[ -s "$FILE" ]] || return 0
+    if (( CUR_SINK < 0 )); then
+        add_issue fail out "Kein Ausgabegerät gefunden" "Kopfhörer/Headset verbinden"
+        return 0
+    fi
+    if [[ "${SINK_MUTE[CUR_SINK]}" == yes ]]; then
+        say "  ${RED}${I_FAIL}${NC} Ausgabe ist stumm – du würdest niemanden hören."
+        if ask_yn "Jetzt einschalten?" && pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null; then
+            SINK_MUTE[CUR_SINK]="no"
+        else
+            add_issue fail out "Ausgabe ist stumm" "pactl set-sink-mute @DEFAULT_SINK@ 0"
+            return 0
+        fi
+    fi
+    if (( ${SINK_VOL[CUR_SINK]:-0} < 10 )); then
+        say "  ${YELLOW}${I_WARN}${NC} Ausgabe-Lautstärke ist nur ${SINK_VOL[CUR_SINK]}%."
+        if ask_yn "Auf 50% setzen?" && pactl set-sink-volume @DEFAULT_SINK@ 50% 2>/dev/null; then
+            SINK_VOL[CUR_SINK]=50
+        fi
+    fi
+
+    if ! play_with_meter "${DIM}Wiedergabe…${NC}"; then
+        local err
+        err=$(grep -v '^[[:space:]]*$' "$PLAY_ERR" 2>/dev/null | head -1)
+        meter_line "${I_OUT} OUTPUT" 0 -1 "-99.0" "${RED}${I_FAIL} Wiedergabe fehlgeschlagen${NC}"
+        printf '\n'
+        add_issue fail out "Wiedergabe fehlgeschlagen${err:+: $err}" "Ausgabegerät prüfen → [d]"
+        return 0
+    fi
+
+    if (( INTERACTIVE )); then
+        local key
+        meter_line "${I_OUT} OUTPUT" "$PEAK_LVL" -1 "$PEAK_DB" "${BOLD}Gehört? [J/n]${NC} "
+        cur_show
+        read -rsn1 key
+        drain_keys
+        cur_hide
+        if [[ "$key" == [nN] ]]; then
+            meter_line "${I_OUT} OUTPUT" "$PEAK_LVL" -1 "$PEAK_DB" "${RED}${I_FAIL} nicht gehört${NC}"
+            add_issue fail out "Wiedergabe nicht gehört" "Ausgabegerät/Lautstärke prüfen → [d] Gerät wählen"
+        else
+            meter_line "${I_OUT} OUTPUT" "$PEAK_LVL" -1 "$PEAK_DB" "${GREEN}${I_OK} gehört${NC}"
+        fi
+    else
+        meter_line "${I_OUT} OUTPUT" "$PEAK_LVL" -1 "$PEAK_DB" "${DIM}abgespielt${NC}"
+    fi
+    printf '\n'
+}
+
+replay_recording() {
+    if play_with_meter "${DIM}Wiedergabe…${NC}"; then
+        meter_line "${I_OUT} OUTPUT" "$PEAK_LVL" -1 "$PEAK_DB" "${DIM}abgespielt${NC}"
+    else
+        meter_line "${I_OUT} OUTPUT" 0 -1 "-99.0" "${RED}${I_FAIL} Wiedergabe fehlgeschlagen${NC}"
+    fi
+    printf '\n'
+}
+
+# ━━━ WEITERE PRÜFUNGEN ━━━
+check_apps() {   # Nehmen laufende Apps vom getesteten Mikrofon auf?
+    APPS_OK=(); APPS_BAD=(); APPS_BAD_IDX=()
+    (( CUR_SRC >= 0 )) || return 0
+    local -A sname=() sdesc=() seen=()
+    local idx name rest i so src app bin media label s x
+    while IFS=$'\t' read -r idx name rest; do
+        [[ -n "$idx" ]] && sname[$idx]="$name"
+    done < <(pactl list sources short 2>/dev/null)
+    for i in "${!SRC_NAME[@]}"; do sdesc[${SRC_NAME[i]}]="${SRC_DESC[i]}"; done
+
+    while IFS='|' read -r so src app bin media; do
+        s="${sname[$src]:-}"
+        [[ -z "$s" || "$s" == *.monitor ]] && continue
+        label="${app:-$bin}"; label="${label:-Stream #$so}"
+        case "${label,,} ${media,,}" in
+            *pavucontrol*|*"volume control"*|*peak*) continue ;;
+        esac
+        if [[ "$s" == "$DEFAULT_SOURCE" ]]; then
+            [[ -n "${seen[$label]:-}" ]] || APPS_OK+=("$label")
+            seen[$label]=1
+        else
+            name="${sdesc[$s]:-$s}"
+            APPS_BAD+=("${label}|${name:0:40}")
+            APPS_BAD_IDX+=("$so")
+        fi
+    done < <(pactl list source-outputs 2>/dev/null | awk "$PA_SO_AWK")
+
+    for x in "${APPS_BAD[@]}"; do
+        # shellcheck disable=SC1111  # deutsche Anführungszeichen
+        add_issue warn app "${x%%|*} nimmt von „${x#*|}“ auf – nicht vom getesteten Mikrofon" \
+            "→ [a] auf getestetes Mikrofon umleiten"
+    done
+}
+
+move_apps() {
+    local so ok=0
+    for so in "${APPS_BAD_IDX[@]}"; do
+        pactl move-source-output "$so" "$DEFAULT_SOURCE" 2>/dev/null && (( ++ok ))
+    done
+    say "  ${GREEN}${I_OK}${NC} ${ok} von ${#APPS_BAD_IDX[@]} App-Stream(s) auf ${BOLD}${MIC_DESC}${NC} umgeleitet"
+    APPS_BAD_IDX=()
+}
+
+check_echo() {   # internes Mikro + Lautsprecher → Echo-Gefahr
+    (( CUR_SRC >= 0 && CUR_SINK >= 0 )) || return 0
+    [[ "${SRC_TYPE[CUR_SRC]}" == internal && "${SINK_TYPE[CUR_SINK]}" == internal ]] || return 0
+    local port="${SINK_PORT[CUR_SINK],,}"
+    [[ "$port" == *headphone* || "$port" == *headset* ]] && return 0
+    add_issue info echo "Lautsprecher + internes Mikrofon: Echo möglich" "Kopfhörer oder Headset verwenden"
+}
+
+check_battery() {
+    if [[ -n "$BT_BATTERY" ]] && (( BT_BATTERY < BATTERY_WARN )); then
+        add_issue warn bat "Headset-Akku nur noch ${BT_BATTERY}%" "vor dem Anruf laden"
+    fi
+    return 0
+}
+
+# ━━━ ERGEBNIS ━━━
+add_issue() {   # $1 = fail|warn|info, $2 = Kategorie, $3 = Text, $4 = Hinweis
+    ISSUES+=("${1}|${2}|${3//|//}|${4//|//}")
+}
+
+compute_verdict() {
+    local x sev
+    VERDICT="OK"
+    for x in "${ISSUES[@]}"; do
+        sev="${x%%|*}"
+        if [[ "$sev" == fail ]]; then VERDICT="FAIL"; return; fi
+        [[ "$sev" == warn ]] && VERDICT="WARN"
+    done
+}
+
+print_report() {
+    local line sev kind text hint x col printed=0
+    say ""
+    if (( HAVE_SIGNAL )); then
+        printed=1
+        line="  "
+        case "$LEVEL_STATE" in
+            ok)    line+="${GREEN}${I_OK} Pegel OK${NC}" ;;
+            quiet) line+="${YELLOW}${I_WARN} Sehr leise${NC}" ;;
+            clip)  line+="${YELLOW}${I_WARN} Übersteuert${NC}" ;;
+        esac
+        col="$GREEN"
+        flt "$SNR_DB" "$SNR_GOOD" && col="$YELLOW"
+        flt "$SNR_DB" "$SNR_OK" && col="$RED"
+        line+=" ${SEP} SNR: ${col}${SNR_DB}dB${NC} ${DIM}(${SNR_RATING})${NC}"
+        fmt_db "$NOISE_DB"
+        line+=" ${SEP} Rauschen: ${REPLY}dB"
+        case "$BW_STATE" in
+            wide)   line+=" ${SEP} Freq: ${GREEN}>4kHz ${I_OK}${NC}" ;;
+            narrow) line+=" ${SEP} Freq: ${YELLOW}≤4kHz${NC}" ;;
+        esac
+        say "$line"
+    fi
+    if (( ${#APPS_OK[@]} + ${#APPS_BAD[@]} )); then
+        line="  Apps am Mikrofon:"
+        for x in "${APPS_OK[@]}"; do line+=" ${GREEN}${x} ${I_OK}${NC}"; done
+        for x in "${APPS_BAD[@]}"; do line+=" ${YELLOW}${x%%|*} ${I_WARN}${NC}"; done
+        say "$line"
+        printed=1
+    elif (( HAVE_SIGNAL )); then
+        local again="nach dem Beitreten erneut prüfen"
+        (( INTERACTIVE && !NO_MENU )) && again+=": [r]"
+        say "  ${DIM}Apps am Mikrofon: noch keine (${again})${NC}"
+    fi
+
+    if (( ${#ISSUES[@]} )); then
+        (( printed )) && say ""
+        for x in "${ISSUES[@]}"; do
+            IFS='|' read -r sev kind text hint <<< "$x"
+            case "$sev" in
+                fail) line="  ${RED}${I_FAIL}${NC} ${text}" ;;
+                warn) line="  ${YELLOW}${I_WARN}${NC} ${text}" ;;
+                *)    line="  ${CYAN}${I_INFO}${NC} ${text}" ;;
+            esac
+            if [[ -n "$hint" ]]; then
+                # Kurze Hinweise in dieselbe Zeile, lange darunter
+                if (( ${#text} + ${#hint} <= 74 )); then
+                    line+="  ${DIM}${hint}${NC}"
+                else
+                    line+=$'\n'"      ${DIM}${hint}${NC}"
+                fi
+            fi
+            say "$line"
+        done
+    fi
+
+    say ""
+    local logp="${LOG_FILE/#$HOME/\~}"
+    case "$VERDICT" in
+        OK)
+            say "  ══ ${BG_GREEN}${BOLD} ${I_READY} BEREIT FÜR DEN ANRUF ${NC} ${DIM}(log:${logp})${NC} ══" ;;
+        WARN)
+            local only_level=1
+            for x in "${ISSUES[@]}"; do
+                IFS='|' read -r sev kind text hint <<< "$x"
+                [[ "$sev" == warn && "$kind" != level ]] && only_level=0
+            done
+            if (( only_level )); then
+                say "  ══ ${BG_YELLOW}${BOLD} ${I_WARNB}PEGEL ANPASSEN ${NC} ${DIM}(log:${logp})${NC} ══"
+            else
+                say "  ══ ${BG_YELLOW}${BOLD} ${I_WARNB}BEREIT MIT EINSCHRÄNKUNGEN ${NC} ${DIM}(log:${logp})${NC} ══"
+            fi ;;
+        FAIL)
+            local what="MIKROFON"
+            for x in "${ISSUES[@]}"; do
+                IFS='|' read -r sev kind text hint <<< "$x"
+                if [[ "$sev" == fail ]]; then [[ "$kind" == out ]] && what="AUDIO"; break; fi
+            done
+            say "  ══ ${BG_RED}${BOLD} ${I_NOTREADY} ${what} PROBLEM – NICHT ANRUFEN ${NC} ${DIM}(log:${logp})${NC} ══" ;;
+    esac
+    say ""
+}
+
+log_result() {
+    local ts freq reasons="" x sev kind text hint mic_pct=""
+    printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
+    case "$BW_STATE" in wide) freq="OK" ;; narrow) freq="WARN" ;; *) freq="n/a" ;; esac
+    for x in "${ISSUES[@]}"; do
+        IFS='|' read -r sev kind text hint <<< "$x"
+        [[ "$sev" == info ]] && continue
+        reasons+="${reasons:+; }${text}"
+    done
+    (( CUR_SRC >= 0 )) && mic_pct="${SRC_VOL[CUR_SRC]}"
+    local codec="n/a"
+    [[ "$BT_ROLE" == mic && -n "$BT_CODEC" ]] && codec="$BT_CODEC"
+    # Felder 1–8 wie bisher (kompatibel mit alten Logs), 9–12 neu
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$ts" "$VERDICT" "${MIC_DESC//|//}" "$codec" "${SNR_DB:-n/a}" "${NOISE_DB:-n/a}" \
+        "${MAX_PEAK:-0}" "$freq" "${PEAK_DB:-n/a}" "${OUT_DESC//|//}" "$mic_pct" "${reasons//|//}" \
+        >> "$LOG_FILE" 2>/dev/null
+}
+
+# ━━━ GERÄTELISTE / AUSWAHL ━━━
+print_device_table() {   # $1 = 1 → nummeriert (für die Auswahl)
+    local numbered=$1 n=0 i c j mark num tl
+    PICK_KIND=(); PICK_REF=()
+    say "  ${BOLD}Mikrofone${NC}"
+    for i in "${!SRC_NAME[@]}"; do
+        (( ++n )); PICK_KIND[n]="src"; PICK_REF[n]=$i
+        mark=" "; [[ "${SRC_NAME[i]}" == "$DEFAULT_SOURCE" ]] && mark="${GREEN}*${NC}"
+        num="    "; (( numbered )) && printf -v num '%3d)' "$n"
+        type_label "${SRC_TYPE[i]}"; tl="$REPLY"
+        vol_label "${SRC_VOL[i]}" "${SRC_MUTE[i]}"
+        say "  ${num} ${mark} ${DIM}[${NC}${tl}${DIM}]${NC} ${SRC_DESC[i]} ${REPLY}"
+    done
+    for c in "${!CARD_NAME[@]}"; do
+        [[ "${CARD_KEY[c]}" == bt:* && -n "${CARD_BEST_MIC[c]}" ]] || continue
+        source_for_key "${CARD_KEY[c]}"
+        (( REPLY >= 0 )) && continue
+        (( ++n )); PICK_KIND[n]="card"; PICK_REF[n]=$c
+        j="${CARD_BEST_MIC[c]}"
+        num="    "; (( numbered )) && printf -v num '%3d)' "$n"
+        type_label bluetooth
+        say "  ${num}   ${DIM}[${NC}${REPLY}${DIM}]${NC} ${CARD_DESC[c]} ${DIM}(Musik-Modus → Headset · ${PROF_CODEC[j]:-HFP})${NC}"
+    done
+    say "  ${BOLD}Ausgaben${NC}"
+    for i in "${!SINK_NAME[@]}"; do
+        (( ++n )); PICK_KIND[n]="sink"; PICK_REF[n]=$i
+        mark=" "; [[ "${SINK_NAME[i]}" == "$DEFAULT_SINK" ]] && mark="${GREEN}*${NC}"
+        num="    "; (( numbered )) && printf -v num '%3d)' "$n"
+        type_label "${SINK_TYPE[i]}"; tl="$REPLY"
+        vol_label "${SINK_VOL[i]}" "${SINK_MUTE[i]}"
+        say "  ${num} ${mark} ${DIM}[${NC}${tl}${DIM}]${NC} ${SINK_DESC[i]} ${REPLY}"
+    done
+}
+
+pick_device() {   # interaktive Geräteauswahl
+    local n key="" suggested=-1 r prompt
+    say ""
+    print_device_table 1
+    say ""
+    cur_show
+    read -r -p "  Mikrofon-Nr. (Enter = behalten): " n
+    if [[ "$n" =~ ^[0-9]+$ && "${PICK_KIND[n]:-}" == src ]]; then
+        r="${PICK_REF[n]}"
+        pactl set-default-source "${SRC_NAME[r]}" 2>/dev/null && {
+            CHANGES+=("Mikrofon → ${SRC_DESC[r]}")
+            key="${SRC_KEY[r]}"
+        }
+    elif [[ "$n" =~ ^[0-9]+$ && "${PICK_KIND[n]:-}" == card ]]; then
+        r="${PICK_REF[n]}"
+        switch_bt_profile "$r" "${CARD_BEST_MIC[r]}"
+    elif [[ -n "$n" ]]; then
+        say "  ${YELLOW}Keine gültige Mikrofon-Nummer – behalte das aktuelle.${NC}"
+    fi
+
+    # Passende Ausgabe zum neu gewählten Mikrofon vorschlagen
+    prompt="  Ausgabe-Nr. (Enter = behalten): "
+    if [[ -n "$key" ]]; then
+        sink_for_key "$key"; suggested=$REPLY
+        (( suggested >= 0 )) && prompt="  Ausgabe-Nr. (Enter = ${SINK_DESC[suggested]}): "
+    fi
+    read -r -p "$prompt" n
+    if [[ -z "$n" ]] && (( suggested >= 0 )); then
+        pactl set-default-sink "${SINK_NAME[suggested]}" 2>/dev/null && CHANGES+=("Ausgabe → ${SINK_DESC[suggested]}")
+    elif [[ "$n" =~ ^[0-9]+$ && "${PICK_KIND[n]:-}" == sink ]]; then
+        r="${PICK_REF[n]}"
+        pactl set-default-sink "${SINK_NAME[r]}" 2>/dev/null && CHANGES+=("Ausgabe → ${SINK_DESC[r]}")
+    elif [[ -n "$n" ]]; then
+        say "  ${YELLOW}Keine gültige Ausgabe-Nummer – behalte die aktuelle.${NC}"
+    fi
+    cur_hide
+    # Manuelle Wahl nicht durch automatische Vorschläge überstimmen
+    ROUTING_LOCKED=1
 }
 
 show_list() {
-    echo "mic-check v${VERSION} – Geräte-Übersicht"
-    echo ""
-    wpctl status 2>/dev/null | awk '
-        /Audio/,/Video/ { print }
-    ' | head -40
-    exit 0
+    detect_all || { say "Fehler: pactl kann den Audio-Server nicht erreichen."; exit 1; }
+    say "mic-check v${VERSION} – Geräte-Übersicht ${DIM}(${AUDIO_SRV})${NC}"
+    say ""
+    print_device_table 0
+    local c j line
+    for c in "${!CARD_NAME[@]}"; do
+        [[ "${CARD_KEY[c]}" == bt:* ]] || continue
+        say ""
+        say "  ${BOLD}Bluetooth: ${CARD_DESC[c]}${NC} ${DIM}(${CARD_ADDR[c]})${NC}"
+        for j in "${!PROF_NAME[@]}"; do
+            (( PROF_CARD[j] == c )) || continue
+            [[ "${PROF_NAME[j]}" == off ]] && continue
+            line="    "
+            if [[ "${PROF_NAME[j]}" == "${CARD_ACTIVE[c]}" ]]; then line+="${GREEN}*${NC} "; else line+="  "; fi
+            if (( PROF_SOURCES[j] > 0 )); then line+="${I_HEADSET}  "; else line+="${I_MUSIC}  "; fi
+            line+="${PROF_NAME[j]}  ${DIM}${PROF_LABEL[j]}${NC}"
+            [[ "${PROF_AVAIL[j]}" == no ]] && line+=" ${DIM}– nicht verfügbar${NC}"
+            say "$line"
+        done
+    done
+    say ""
 }
 
 show_history() {
-    echo "mic-check v${VERSION} – Test-Verlauf"
-    echo ""
+    say "mic-check v${VERSION} – Test-Verlauf"
+    say ""
     if [[ ! -f "$LOG_FILE" ]]; then
-        echo "  Noch keine Tests gespeichert."
-        echo "  Log-Datei: ${LOG_FILE}"
-    else
-        echo "  Letzte 20 Ergebnisse (${LOG_FILE}):"
-        echo ""
-        tail -20 "$LOG_FILE" | while IFS='|' read -r ts verdict device codec snr_val noise_val peak_val freq_ok; do
-            local icon="?"
-            case "$verdict" in
-                OK)   icon="✓" ;;
-                WARN) icon="⚠" ;;
-                FAIL) icon="✗" ;;
-            esac
-            printf "  %s  %s  %-6s  %-25s  Codec:%-5s  SNR:%s  Noise:%s  Peak:%s  Freq:%s\n" \
-                "$ts" "$icon" "$verdict" "$device" "$codec" "$snr_val" "$noise_val" "$peak_val" "$freq_ok"
-        done
+        say "  Noch keine Tests gespeichert."
+        say "  Log-Datei: ${LOG_FILE}"
+        say ""
+        return
     fi
-    echo ""
-    exit 0
-}
-
-# --- OPTIONEN ---
-KEEP_DEVICES=0
-DEBUG=0
-SCRIPT_ARGS=("$@")   # Original-Argumente für Restart (exec) merken
-for arg in "$@"; do
-    case "$arg" in
-        --help|-h)    show_help ;;
-        --version|-v) echo "mic-check v${VERSION}"; exit 0 ;;
-        --keep)       KEEP_DEVICES=1 ;;
-        --debug)      DEBUG=1 ;;
-        --list)       show_list ;;
-        --history)    show_history ;;
-    esac
-done
-
-BYTES_PER_SEC=$(( RATE * CHANNELS * (BITS / 8) ))
-CHUNK_BYTES=$(( BYTES_PER_SEC / 5 ))
-CHUNK_COUNT=$(( CHECK_SECS * 5 ))
-FILE=$(mktemp /tmp/miccheck.XXXXXX.raw)
-
-RESTART_COUNT="${_MICCHECK_RESTARTS:-0}"
-
-# --- Farben ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
-BG_RED='\033[41m'
-BG_GREEN='\033[42m'
-
-# ━━━ AUDIO-SERVER ERKENNUNG ━━━
-detect_audio_server() {
-    AUDIO_SERVER="unknown"
-    AUDIO_SERVER_VERSION=""
-
-    if command -v pipewire &>/dev/null && pgrep -x pipewire &>/dev/null; then
-        AUDIO_SERVER="pipewire"
-        AUDIO_SERVER_VERSION=$(pipewire --version 2>/dev/null | grep -oP 'pipewire\s+\K[0-9.]+' | head -1)
-        if pgrep -f pipewire-pulse &>/dev/null; then
-            AUDIO_SERVER="${AUDIO_SERVER}+pulse"
-        fi
-    elif command -v pulseaudio &>/dev/null && pgrep -x pulseaudio &>/dev/null; then
-        AUDIO_SERVER="pulseaudio"
-        AUDIO_SERVER_VERSION=$(pulseaudio --version 2>/dev/null | grep -oP '[0-9.]+' | head -1)
-    fi
-
-    # WirePlumber als Session-Manager?
-    if pgrep -x wireplumber &>/dev/null; then
-        SESSION_MANAGER="wireplumber"
-    else
-        SESSION_MANAGER=""
-    fi
-}
-
-# ━━━ BLUETOOTH CODEC/PROFIL ERKENNUNG ━━━
-detect_bt_codec() {
-    BT_CODEC=""
-    BT_PROFILE=""
-    BT_PROFILE_LABEL=""
-    BT_CODEC_WARNING=""
-    BT_ALL_PROFILES=()
-
-    # Kein BT-Gerät → nichts zu tun
-    [[ -z "$BT_SRC_ID" && -z "$BT_SINK_ID" ]] && return
-
-    # Finde den Bluetooth-Device-Namen für pactl
-    local bt_device_id="${BT_SRC_ID:-$BT_SINK_ID}"
-
-    # Aktives Profil über wpctl inspect ermitteln
-    local inspect_src="" inspect_sink=""
-    if [[ -n "$BT_SRC_ID" ]]; then
-        inspect_src=$(wpctl inspect "$BT_SRC_ID" 2>/dev/null)
-    fi
-    if [[ -n "$BT_SINK_ID" ]]; then
-        inspect_sink=$(wpctl inspect "$BT_SINK_ID" 2>/dev/null)
-    fi
-
-    # Codec aus der media.name / node.name / api.bluez5.codec Eigenschaft
-    local codec_line
-    codec_line=$(echo "$inspect_src" "$inspect_sink" | grep -i 'api.bluez5.codec' | head -1)
-    if [[ -n "$codec_line" ]]; then
-        BT_CODEC=$(echo "$codec_line" | sed 's/.*= *"\?\([^"]*\)"\?/\1/' | xargs)
-    fi
-
-    # Profil-Erkennung: pactl list cards für Bluetooth-Karte
-    local bt_card_info
-    bt_card_info=$(pactl list cards 2>/dev/null | awk '
-        /Name:.*bluez/{found=1}
-        found{print}
-        found && /^$/{found=0}
-    ')
-
-    if [[ -n "$bt_card_info" ]]; then
-        # Aktives Profil
-        BT_PROFILE=$(echo "$bt_card_info" | grep -A1 "Active Profile:" | head -1 | sed 's/.*Active Profile: *//')
-
-        # Alle verfügbaren Profile sammeln
-        local in_profiles=0
-        while IFS= read -r line; do
-            if echo "$line" | grep -q "Profiles:"; then
-                in_profiles=1
-                continue
-            fi
-            if (( in_profiles )); then
-                # Ende der Profile-Sektion
-                if echo "$line" | grep -qE "^[[:space:]]*(Active Profile|Ports):"; then
-                    break
-                fi
-                local pname
-                pname=$(echo "$line" | sed 's/^\s*//' | cut -d: -f1 | xargs)
-                [[ -n "$pname" && "$pname" != "off" ]] && BT_ALL_PROFILES+=("$pname")
-            fi
-        done <<< "$bt_card_info"
-    fi
-
-    # Profil-Label für Anzeige
-    case "$BT_PROFILE" in
-        *handsfree*head*unit*HFP*|*handsfree_head_unit*)
-            BT_PROFILE_LABEL="Handsfree (HFP)" ;;
-        *headset*head*unit*|*headset_head_unit*)
-            BT_PROFILE_LABEL="Headset (HSP/HFP)" ;;
-        *a2dp*sink*|*a2dp-sink*)
-            BT_PROFILE_LABEL="Headphones (A2DP)" ;;
-        *)
-            BT_PROFILE_LABEL="$BT_PROFILE" ;;
-    esac
-
-    # Codec-Label normalisieren
-    case "$BT_CODEC" in
-        msbc|mSBC|MSBC)   BT_CODEC="mSBC" ;;
-        cvsd|CVSD)         BT_CODEC="CVSD" ;;
-        sbc_xq|sbc-xq)    BT_CODEC="SBC-XQ" ;;
-        sbc|SBC)           BT_CODEC="SBC" ;;
-        aac|AAC)           BT_CODEC="AAC" ;;
-    esac
-
-    # Warnung wenn nicht optimaler Codec für Mikrofon
-    if [[ -n "$BT_CODEC" ]]; then
-        case "$BT_CODEC" in
-            mSBC)
-                BT_CODEC_WARNING="" ;;  # Bester Codec für Mikro
-            CVSD)
-                BT_CODEC_WARNING="CVSD hat niedrige Qualität (8kHz). mSBC wäre besser." ;;
-            SBC|SBC-XQ|AAC)
-                BT_CODEC_WARNING="A2DP-Codec – kein Mikrofon verfügbar! Wechsle zu Handsfree (mSBC)." ;;
+    say "  Letzte ${HISTORY_N} Ergebnisse (${LOG_FILE}):"
+    say ""
+    local ts verdict device codec snr noise peak freq peak_db reasons icon
+    while IFS='|' read -r ts verdict device codec snr noise peak freq peak_db _ _ reasons; do
+        [[ -z "$ts" ]] && continue
+        case "$verdict" in
+            OK)   icon="${GREEN}${I_OK}${NC}" ;;
+            WARN) icon="${YELLOW}${I_WARN}${NC}" ;;
+            FAIL) icon="${RED}${I_FAIL}${NC}" ;;
+            *)    icon="?" ;;
         esac
-    fi
+        # Alte Einträge (8 Felder) haben nur den Roh-Peak
+        if [[ -z "$peak_db" && "$peak" =~ ^[0-9]+$ ]] && (( peak > 0 )); then
+            peak_db=$(awk -v p="$peak" 'BEGIN { printf "%.1f", 20 * log(p / 32768) / log(10) }')
+        fi
+        printf '  %s  %s %-4s  %-28.28s  Codec:%-6s  SNR:%-5s  Noise:%-6s  Peak:%-6s  Freq:%s\n' \
+            "$ts" "$icon" "$verdict" "$device" "$codec" "$snr" "$noise" "${peak_db:-n/a}" "$freq"
+        [[ -n "$reasons" ]] && say "      ${DIM}${reasons}${NC}"
+    done < <(tail -n "$HISTORY_N" "$LOG_FILE")
+    say ""
 }
 
-# ━━━ AUTO-SWITCH BT → HANDSFREE mSBC (System-weit) ━━━
-# 3-Sekunden-Countdown mit [Leertaste] zum Abbrechen
-countdown_switch() {
-    local message="$1"
-    local seconds="${2:-3}"
-
-    tput cnorm
-    local key end remain
-    end=$(( $(date +%s) + seconds ))
-    while (( (remain = end - $(date +%s)) > 0 )); do
-        printf "\r    ${YELLOW}⏳ ${message} in ${BOLD}${remain}s${NC}${YELLOW} – [Leertaste] zum Überspringen${NC}  "
-        # read mit 1s Timeout, einzelnes Zeichen. Restzeit kommt aus der Uhr,
-        # daher kürzen Nicht-Skip-Tasten den Countdown nicht ab.
-        if read -r -s -n 1 -t 1 key 2>/dev/null; then
-            if [[ "$key" == "" || "$key" == " " ]]; then
-                printf "\r    ${DIM}↷ Übersprungen.${NC}%40s\n"
-                tput civis
-                return 1
-            fi
-        fi
+# ━━━ MENÜ ━━━
+run_menu() {
+    NEXT_ACTION="quit"
+    (( INTERACTIVE && !NO_MENU )) || return 0
+    local key opts
+    while :; do
+        opts="[Enter] Ende  [r] Nochmal"
+        (( HAVE_SIGNAL )) && [[ -s "$FILE" ]] && opts+="  [p] Anhören"
+        [[ -n "$GAIN_NEW_PCT" ]] && opts+="  ${NC}${BOLD}[g] Gain → ${GAIN_NEW_PCT}%${NC}${DIM}"
+        (( ${#APPS_BAD_IDX[@]} )) && opts+="  ${NC}${BOLD}[a] Apps umleiten${NC}${DIM}"
+        opts+="  [d] Gerät wählen"
+        printf '  %s%s%s ' "$DIM" "$opts" "$NC"
+        cur_show
+        read -rsn1 key
+        drain_keys
+        printf '\r%s' "$EL"
+        case "$key" in
+            ""|q|Q) NEXT_ACTION="quit"; return 0 ;;
+            r|R)    NEXT_ACTION="repeat"; return 0 ;;
+            p|P)    (( HAVE_SIGNAL )) && replay_recording ;;
+            g|G)
+                if [[ -n "$GAIN_NEW_PCT" ]] && pactl set-source-volume @DEFAULT_SOURCE@ "${GAIN_NEW_PCT}%" 2>/dev/null; then
+                    CHANGES+=("Mic-Gain → ${GAIN_NEW_PCT}%")
+                    NEXT_ACTION="repeat"; return 0
+                fi ;;
+            a|A)    (( ${#APPS_BAD_IDX[@]} )) && move_apps ;;
+            d|D)    pick_device; NEXT_ACTION="repeat"; return 0 ;;
+        esac
     done
-    printf "\r%80s\r"
-    tput civis
-    return 0
 }
 
-switch_bt_to_msbc() {
-    # Nur wenn BT-Gerät vorhanden und nicht bereits auf mSBC
-    [[ -z "$BT_SRC_ID" && -z "$BT_SINK_ID" ]] && return 1
-    [[ "$BT_CODEC" == "mSBC" ]] && return 1
-
-    # Finde BT-Karten-Name über pactl
-    local bt_card_name
-    bt_card_name=$(pactl list cards short 2>/dev/null | grep -i 'bluez' | awk '{print $2}' | head -1)
-    [[ -z "$bt_card_name" ]] && return 1
-
-    # Profil-Auswahl: Bestes Handsfree-Profil finden
-    # Priorität: 1) headset-head-unit (ohne suffix = mSBC)
-    #            2) *msbc* Variante
-    #            3) irgendein headset/handsfree Profil (nicht -cvsd)
-    #            4) headset-head-unit-cvsd als letzter Fallback
-    local best_profile=""
-
-    # 1) Exakt "headset-head-unit" (ohne Suffix = mSBC auf den meisten Systemen)
-    for p in "${BT_ALL_PROFILES[@]}"; do
-        [[ "$p" == "headset-head-unit" ]] && { best_profile="$p"; break; }
-    done
-
-    # 2) Explizites mSBC-Profil
-    if [[ -z "$best_profile" ]]; then
-        for p in "${BT_ALL_PROFILES[@]}"; do
-            if echo "$p" | grep -qi 'msbc'; then
-                best_profile="$p"
-                break
-            fi
-        done
+# Bei "kein Signal" direkt ein anderes Mikrofon anbieten → 0 = umgeschaltet
+offer_alternative() {
+    [[ "$LEVEL_STATE" == none ]] || return 1
+    (( INTERACTIVE && !KEEP_DEVICES && !ROUTING_LOCKED )) || return 1
+    (( CUR_SRC >= 0 )) && NOSIG_TRIED[${SRC_KEY[CUR_SRC]}]=1
+    best_alternative
+    [[ -n "$REPLY_KIND" ]] || return 1
+    local name tn kind="$REPLY_KIND" ref="$REPLY_REF"
+    if [[ "$kind" == src ]]; then
+        name="${SRC_DESC[ref]}"; type_name "${SRC_TYPE[ref]}"; tn="$REPLY"
+    else
+        name="${CARD_DESC[ref]}"; tn="Bluetooth-Headset"
     fi
-
-    # 3) Handsfree/Headset (nicht CVSD)
-    if [[ -z "$best_profile" ]]; then
-        for p in "${BT_ALL_PROFILES[@]}"; do
-            if echo "$p" | grep -qi 'handsfree\|headset.*head.*unit\|hfp' && \
-               ! echo "$p" | grep -qi 'cvsd'; then
-                best_profile="$p"
-                break
-            fi
-        done
-    fi
-
-    # 4) Letzter Fallback: CVSD (besser als A2DP ohne Mic)
-    if [[ -z "$best_profile" ]]; then
-        for p in "${BT_ALL_PROFILES[@]}"; do
-            if echo "$p" | grep -qi 'handsfree\|headset.*head.*unit\|hfp\|cvsd'; then
-                best_profile="$p"
-                break
-            fi
-        done
-    fi
-
-    [[ -z "$best_profile" ]] && return 1
-    [[ "$best_profile" == "$BT_PROFILE" ]] && return 1
-
-    # Nachricht abhängig vom aktuellen Codec
-    local switch_msg=""
-    case "$BT_CODEC" in
-        CVSD)
-            echo -e "    ${YELLOW}⚠ CVSD hat niedrige Qualität (8kHz). mSBC wäre besser.${NC}"
-            switch_msg="Wechsle zu ${best_profile}"
-            ;;
-        SBC|SBC-XQ|AAC)
-            echo -e "    ${YELLOW}⚠ A2DP-Codec – kein Mikrofon verfügbar! Wechsle zu Handsfree (mSBC).${NC}"
-            switch_msg="Wechsle zu ${best_profile}"
-            ;;
-        *)
-            echo -e "    ${YELLOW}⚠ Profil nicht optimal für Mikrofon.${NC}"
-            switch_msg="Wechsle zu ${best_profile}"
-            ;;
-    esac
-    echo ""
-
-    if countdown_switch "$switch_msg" 3; then
-        echo -e "    ${DIM}Setze BT-Profil system-weit → ${best_profile}...${NC}"
-        pactl set-card-profile "$bt_card_name" "$best_profile" 2>/dev/null
-
-        if (( $? == 0 )); then
-            echo -e "    ${GREEN}✓${NC} Profil umgeschaltet auf ${BOLD}${best_profile}${NC} (system-weit)"
-            sleep 1
-            echo ""
-            echo -e "    ${BOLD}↻ Starte Mic-Check neu...${NC}"
-            do_restart
+    cur_show
+    if ask_yn "Stattdessen ${tn} testen: ${name}?"; then
+        say ""
+        if [[ "$kind" == src ]]; then
+            switch_to_source "$ref" || return 1
         else
-            echo -e "    ${RED}✗${NC} Profilwechsel fehlgeschlagen"
-            echo ""
+            switch_bt_profile "$ref" "${CARD_BEST_MIC[ref]}" || return 1
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# ━━━ EIN DURCHLAUF ━━━
+reset_run_state() {
+    ISSUES=(); GAIN_NEW_PCT=""; APPS_OK=(); APPS_BAD=(); APPS_BAD_IDX=()
+    HAVE_SIGNAL=0; LEVEL_STATE=""; BW_STATE=""
+    SNR_DB=""; SNR_RATING=""; NOISE_DB=""; PEAK_DB=""; MAX_PEAK=0; CLIP_COUNT=0
+    VERDICT=""
+}
+
+finish_run() {
+    compute_verdict
+    print_report
+    log_result
+    if offer_alternative; then NEXT_ACTION="repeat"; return; fi
+    run_menu
+}
+
+run_check() {
+    reset_run_state
+    if ! detect_all; then
+        say "${RED}Fehler: pactl kann den Audio-Server nicht erreichen.${NC}"
+        exit 1
+    fi
+    print_header
+    debug_dump
+
+    if (( !KEEP_DEVICES && !ROUTING_LOCKED && INTERACTIVE )); then
+        smart_routing
+        (( REDETECT )) && return 0
+    fi
+
+    if (( CUR_SRC < 0 )); then
+        add_issue fail mic "Kein Mikrofon gefunden" "Headset verbinden · ./mic-check.sh --list"
+        finish_run
+        return 0
+    fi
+    check_mic_state || { finish_run; return 0; }
+
+    if measure; then
+        analyze
+        evaluate_level
+        if (( HAVE_SIGNAL )); then
+            evaluate_quality
+            playback
+            check_bandwidth
         fi
     fi
-    echo ""
-    return 0
+    check_apps
+    check_echo
+    check_battery
+    finish_run
 }
 
-# ━━━ FREQUENZGANG-PRÜFUNG ━━━
-check_frequency_response() {
-    FREQ_OK=""
-    FREQ_HAS_HIGH=""
-    FREQ_WARNING=""
-    FREQ_BANDWIDTH=""
-
-    # Braucht die Aufnahme-Datei
-    [[ ! -s "$FILE" ]] && return
-
-    # sox stat -freq liefert Frequenz-Amplitude-Paare
-    local freq_data
-    freq_data=$(sox -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer "$FILE" \
-        -n stat -freq 2>&1 | awk '$1 ~ /^[0-9]/ && $2 ~ /^[0-9]/ {print $1, $2}')
-
-    [[ -z "$freq_data" ]] && return
-
-    # Energie in Bändern messen
-    # Band 1: 300-1000 Hz (Grundfrequenz Stimme)
-    # Band 2: 1000-4000 Hz (Klarheit/Verständlichkeit)
-    # Band 3: 4000-8000 Hz (Brillanz/Zischlaute)
-    local energy_low energy_mid energy_high
-    energy_low=$(echo "$freq_data" | awk '$1+0 >= 300 && $1+0 < 1000 {s += $2*$2} END{print s+0}')
-    energy_mid=$(echo "$freq_data" | awk '$1+0 >= 1000 && $1+0 < 4000 {s += $2*$2} END{print s+0}')
-    energy_high=$(echo "$freq_data" | awk '$1+0 >= 4000 && $1+0 < 8000 {s += $2*$2} END{print s+0}')
-
-    # Prüfe ob 4kHz+ vorhanden (CVSD schneidet bei 4kHz ab)
-    if (( $(awk "BEGIN{print ($energy_high > 0 && $energy_mid > 0) ? 1 : 0}") )); then
-        local ratio_high_mid
-        ratio_high_mid=$(awk "BEGIN{printf \"%.2f\", $energy_high / ($energy_mid + 0.001)}")
-
-        if (( $(awk "BEGIN{print ($ratio_high_mid > 0.01) ? 1 : 0}") )); then
-            FREQ_HAS_HIGH="yes"
-            FREQ_BANDWIDTH="Breitband (>4kHz)"
-        else
-            FREQ_HAS_HIGH="no"
-            FREQ_BANDWIDTH="Schmalband (≤4kHz)"
-        fi
-    else
-        FREQ_HAS_HIGH="no"
-        FREQ_BANDWIDTH="Schmalband (≤4kHz)"
-    fi
-
-    # Bewertung
-    if [[ "$FREQ_HAS_HIGH" == "yes" ]]; then
-        FREQ_OK="OK"
-    else
-        FREQ_OK="WARN"
-        if [[ "$BT_CODEC" == "CVSD" ]]; then
-            FREQ_WARNING="CVSD-Codec begrenzt auf 4kHz – Wechsel zu mSBC empfohlen."
-        else
-            FREQ_WARNING="Kein Signal über 4kHz erkannt – Sprachqualität eingeschränkt."
-        fi
-    fi
-}
-
-# ━━━ SNR-BERECHNUNG ━━━
-calculate_snr() {
-    SNR_DB=""
-    SNR_RATING=""
-
-    # Braucht Noise Floor und Signal Peak
-    (( NOISE_PEAK <= 0 )) && NOISE_PEAK=1
-    (( max_peak <= 0 )) && return
-
-    SNR_DB=$(awk "BEGIN{printf \"%.1f\", 20*log($max_peak/$NOISE_PEAK)/log(10)}")
-    local snr_int=${SNR_DB%%.*}
-
-    if (( snr_int >= 40 )); then
-        SNR_RATING="exzellent"
-    elif (( snr_int >= 25 )); then
-        SNR_RATING="gut"
-    elif (( snr_int >= 15 )); then
-        SNR_RATING="akzeptabel"
-    else
-        SNR_RATING="schlecht – Hintergrundgeräusche zu laut"
-    fi
-}
-
-# ━━━ ERGEBNIS LOGGEN ━━━
-log_result() {
-    local timestamp device codec snr_val noise_val peak_val freq_val verdict_val
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    device=$(extract_name "$DEFAULT_SRC_LINE")
-    codec="${BT_CODEC:-n/a}"
-    snr_val="${SNR_DB:-n/a}"
-    noise_val="${NOISE_DB:-n/a}"
-    peak_val="${max_peak:-0}"
-    freq_val="${FREQ_OK:-n/a}"
-    verdict_val="${VERDICT:-FAIL}"
-
-    echo "${timestamp}|${verdict_val}|${device}|${codec}|${snr_val}|${noise_val}|${peak_val}|${freq_val}" >> "$LOG_FILE"
-}
-
-# ━━━ RAUSCHBODEN-MESSUNG ━━━
-measure_noise_floor() {
-    local noise_file
-    noise_file=$(mktemp /tmp/micnoise.XXXXXX.raw)
-
-    # 1 Sekunde Stille aufnehmen
-    rec -q -c $CHANNELS -r $RATE -b $BITS -e signed-integer -t raw "$noise_file" \
-        trim 0 1 2>/dev/null
-
-    if [[ -s "$noise_file" ]]; then
-        NOISE_PEAK=$(od -An -td2 -v "$noise_file" | tr -s ' \n' '\n' | \
-            awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
-        if (( NOISE_PEAK > 0 )); then
-            NOISE_DB=$(awk "BEGIN{printf \"%.1f\", 20*log($NOISE_PEAK/32768)/log(10)}")
-        else
-            NOISE_DB="-inf"
-        fi
-    else
-        NOISE_PEAK=0
-        NOISE_DB="-inf"
-    fi
-
-    rm -f "$noise_file"
-}
-
+# ━━━ AUFRÄUMEN ━━━
+# shellcheck disable=SC2317  # wird über trap aufgerufen
 cleanup() {
-    tput cnorm 2>/dev/null
-    rm -f "$FILE" 2>/dev/null
-    [[ -n "$PLAY_PIPE" ]] && rm -f "$PLAY_PIPE" 2>/dev/null
-    [[ -n "$MIC_PIPE" ]]  && rm -f "$MIC_PIPE"  2>/dev/null
-    [[ -n "$WAIT_PIPE" ]] && rm -f "$WAIT_PIPE" 2>/dev/null
+    [[ -n "${REC_PID:-}" ]] && kill "$REC_PID" 2>/dev/null
+    [[ -n "${PLAY_PID:-}" ]] && kill "$PLAY_PID" 2>/dev/null
+    cur_show
+    [[ -n "${WORK:-}" && -d "$WORK" && "$WORK" == */mic-check.* ]] && rm -rf -- "$WORK"
 }
+
+# ━━━ START ━━━
+case "$ACTION" in
+    help)    show_help; exit 0 ;;
+    version) echo "mic-check v${VERSION}"; exit 0 ;;
+esac
+
+setup_ui
+
+if [[ "$ACTION" == history ]]; then
+    show_history
+    exit 0
+fi
+
+# --- Abhängigkeiten ---
+missing=()
+command -v sox   >/dev/null || missing+=("sox")
+command -v rec   >/dev/null || missing+=("rec (Teil von sox)")
+command -v pactl >/dev/null || missing+=("pactl (libpulse / pulseaudio-utils)")
+if (( ${#missing[@]} )); then
+    say "${RED}Fehler: fehlende Programme: ${missing[*]}${NC}"
+    say "  Arch/CachyOS:  sudo pacman -S sox libpulse"
+    say "  Debian/Ubuntu: sudo apt install sox pulseaudio-utils"
+    say "  Fedora:        sudo dnf install sox pulseaudio-utils"
+    exit 1
+fi
+if ! pactl info >/dev/null 2>&1; then
+    say "${RED}Fehler: pactl erreicht keinen Audio-Server.${NC}"
+    say "  ${DIM}Bei PipeWire muss pipewire-pulse laufen: systemctl --user status pipewire-pulse${NC}"
+    exit 1
+fi
+
+if [[ "$ACTION" == list ]]; then
+    show_list
+    exit 0
+fi
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/mic-check.XXXXXX") || exit 1
+FILE="$WORK/rec.raw"
+WAIT_FILE="$WORK/wait.raw"
+CHUNK="$WORK/chunk.raw"
+REC_FIFO="$WORK/rec.fifo"
+REC_ERR="$WORK/rec.err"
+PLAY_ERR="$WORK/play.err"
+# shellcheck disable=SC2017  # erst teilen, damit der Block ganze Frames enthält
+CHUNK_BYTES=$(( RATE / CHUNKS_PER_SEC * CHANNELS * (BITS / 8) ))
+CHUNK_SECS=$(awk -v c="$CHUNKS_PER_SEC" 'BEGIN { printf "%.3f", 1 / c }')
+REC_PID=""
+PLAY_PID=""
 trap cleanup EXIT
+trap 'printf "\n"; exit 130' INT TERM
 
-# ━━━ VU-BALKEN ━━━
-draw_vu() {
-    local peak="$1"
-    local level=$(( peak * BAR_W / 32768 ))
-    (( level > BAR_W )) && level=$BAR_W
+declare -A DECLINED=() NOSIG_TRIED=()
+CHANGES=()
+ROUTING_LOCKED=0
+auto_switches=0
 
-    local db
-    if (( peak > 0 )); then
-        db=$(awk "BEGIN{printf \"%.1f\", 20*log($peak/32768)/log(10)}")
-    else
-        db="-inf"
-    fi
-
-    local color="$GREEN"
-    (( level > BAR_W * 70 / 100 )) && color="$RED"
-    (( level > BAR_W * 45 / 100 && level <= BAR_W * 70 / 100 )) && color="$YELLOW"
-
-    local bar="" empty=""
-    (( level > 0 )) && bar=$(printf '█%.0s' $(seq 1 "$level"))
-    local rest=$(( BAR_W - level ))
-    (( rest > 0 )) && empty=$(printf '░%.0s' $(seq 1 "$rest"))
-
-    printf "[${color}%s${NC}%s] %s dB" "$bar" "$empty" "$db"
-}
-
-# Nur der Balken ohne dB-Wert
-draw_bar() {
-    local peak="$1"
-    local level=$(( peak * BAR_W / 32768 ))
-    (( level > BAR_W )) && level=$BAR_W
-
-    local color="$GREEN"
-    (( level > BAR_W * 70 / 100 )) && color="$RED"
-    (( level > BAR_W * 45 / 100 && level <= BAR_W * 70 / 100 )) && color="$YELLOW"
-
-    local bar="" empty=""
-    (( level > 0 )) && bar=$(printf '█%.0s' $(seq 1 "$level"))
-    local rest=$(( BAR_W - level ))
-    (( rest > 0 )) && empty=$(printf '░%.0s' $(seq 1 "$rest"))
-
-    printf "[${color}%s${NC}%s]" "$bar" "$empty"
-}
-
-# ━━━ ROBUSTE PARSER ━━━
-
-# Holt die erste Zahl die direkt vor einem Punkt steht
-# "│  *  147. USB Composite Device Mono [vol: 1.00]" → "147"
-extract_id() {
-    echo "$1" | grep -oE '[0-9]+\.' | head -1 | tr -d '.'
-}
-
-# Gibt die ganze Zeile ab "ID. Name" zurück (Tree-Zeichen + Sterne weg)
-# "│  *  147. USB Composite Device Mono [vol: 1.00]" → "147. USB Composite Device Mono [vol: 1.00]"
-extract_display() {
-    echo "$1" | sed 's/^[^0-9]*//'
-}
-
-# Nur der Name (ohne ID und ohne [...])
-# "│  *  147. USB Composite Device Mono [vol: 1.00]" → "USB Composite Device Mono"
-extract_name() {
-    local display
-    display=$(extract_display "$1")
-    # Entferne "123. " am Anfang, dann alles ab "["
-    echo "$display" | sed 's/^[0-9]*\.\s*//' | sed 's/\[.*//' | xargs
-}
-
-# Bestimmt Verbindungstyp anhand des Zeileninhalts
-line_type() {
-    local line="$1"
-    if echo "$line" | grep -qi "usb"; then
-        echo "usb"
-    elif echo "$line" | grep -qi "bluez\|haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats\|oneplus"; then
-        echo "bluetooth"
-    elif echo "$line" | grep -qi "arrow\|cavs\|realtek\|hdmi\|built-in\|alc\|intel"; then
-        echo "internal"
-    else
-        echo "unknown"
-    fi
-}
-
-# ━━━ GERÄTE-ERKENNUNG ━━━
-detect_devices() {
-    local wpctl_raw
-    wpctl_raw=$(wpctl status 2>/dev/null)
-
-    # --- Sektionen via Zeilennummern ---
-    local sinks_ln sources_ln filters_ln streams_ln total_ln
-
-    sinks_ln=$(echo "$wpctl_raw" | grep -n "Sinks:" | head -1 | cut -d: -f1)
-    sources_ln=$(echo "$wpctl_raw" | grep -n "Sources:" | head -1 | cut -d: -f1)
-    filters_ln=$(echo "$wpctl_raw" | grep -n "Filters:" | head -1 | cut -d: -f1)
-    streams_ln=$(echo "$wpctl_raw" | grep -n "Streams:" | head -1 | cut -d: -f1)
-    total_ln=$(echo "$wpctl_raw" | wc -l)
-
-    local sinks_block="" sources_block="" filters_block=""
-
-    if [[ -n "$sinks_ln" && -n "$sources_ln" ]] && (( sources_ln > sinks_ln + 1 )); then
-        sinks_block=$(echo "$wpctl_raw" | sed -n "$((sinks_ln + 1)),$((sources_ln - 1))p")
-    fi
-
-    if [[ -n "$sources_ln" && -n "$filters_ln" ]] && (( filters_ln > sources_ln + 1 )); then
-        sources_block=$(echo "$wpctl_raw" | sed -n "$((sources_ln + 1)),$((filters_ln - 1))p")
-    fi
-
-    local filters_end=$(( ${streams_ln:-$total_ln} - 1 ))
-    if [[ -n "$filters_ln" ]] && (( filters_end > filters_ln )); then
-        filters_block=$(echo "$wpctl_raw" | sed -n "$((filters_ln + 1)),${filters_end}p")
-    fi
-
-    # Nur Zeilen mit Node-IDs (haben "Zahl." Muster gefolgt von Buchstaben)
-    sinks_block=$(echo "$sinks_block" | grep -E '[0-9]+\.\s+[A-Za-z]')
-    sources_block=$(echo "$sources_block" | grep -E '[0-9]+\.\s+[A-Za-z]')
-    filters_block=$(echo "$filters_block" | grep -E '[0-9]+\.')
-
-    # --- Debug ---
-    if (( DEBUG )); then
-        echo -e "  ${DIM}[DEBUG] Sinks (ab Zeile $sinks_ln):${NC}"
-        echo "$sinks_block" | sed 's/^/    /'
-        echo -e "  ${DIM}[DEBUG] Sources (ab Zeile $sources_ln):${NC}"
-        echo "$sources_block" | sed 's/^/    /'
-        echo -e "  ${DIM}[DEBUG] Filters (ab Zeile $filters_ln):${NC}"
-        echo "$filters_block" | sed 's/^/    /'
-        echo ""
-    fi
-
-    # --- Default Source ---
-    DEFAULT_SRC_LINE=$(echo "$sources_block" | grep '[*]' | head -1)
-    if [[ -z "$DEFAULT_SRC_LINE" ]]; then
-        DEFAULT_SRC_LINE=$(echo "$filters_block" | grep '[*]' | head -1)
-    fi
-    CURRENT_SRC_ID=$(extract_id "$DEFAULT_SRC_LINE")
-    CURRENT_SRC_TYPE=$(line_type "$DEFAULT_SRC_LINE")
-
-    # --- Default Sink ---
-    DEFAULT_SINK_LINE=$(echo "$sinks_block" | grep '[*]' | head -1)
-    CURRENT_SINK_ID=$(extract_id "$DEFAULT_SINK_LINE")
-    CURRENT_SINK_TYPE=$(line_type "$DEFAULT_SINK_LINE")
-
-    # --- USB Source ---
-    USB_SRC_ID=""
-    USB_SRC_NAME=""
-    USB_SRC_LINE=""
-    local usb_src_line
-    usb_src_line=$(echo "$sources_block" | grep -i "usb" | head -1)
-    if [[ -n "$usb_src_line" ]]; then
-        USB_SRC_ID=$(extract_id "$usb_src_line")
-        USB_SRC_NAME=$(extract_name "$usb_src_line")
-        USB_SRC_LINE="$usb_src_line"
-    fi
-
-    # --- Bluetooth Source ---
-    BT_SRC_ID=""
-    BT_SRC_NAME=""
-    BT_SRC_LINE=""
-    local bt_src_line=""
-
-    # 1) Unter Sources: bekannte Headset-Namen
-    bt_src_line=$(echo "$sources_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats\|oneplus" | head -1)
-
-    # 2) Unter Sources: alles was nicht intern/USB
-    if [[ -z "$bt_src_line" ]]; then
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local lt
-            lt=$(line_type "$line")
-            [[ "$lt" == "internal" || "$lt" == "usb" ]] && continue
-            bt_src_line="$line"
-            break
-        done <<< "$sources_block"
-    fi
-
-    # 3) Unter Filters: bluez_input (NICHT bluez_capture_internal!)
-    if [[ -z "$bt_src_line" ]]; then
-        bt_src_line=$(echo "$filters_block" | grep -i 'bluez_input\.' | grep -vi 'capture_internal' | head -1)
-    fi
-
-    if [[ -n "$bt_src_line" ]]; then
-        BT_SRC_ID=$(extract_id "$bt_src_line")
-        BT_SRC_NAME=$(extract_name "$bt_src_line")
-        BT_SRC_LINE="$bt_src_line"
-    fi
-
-    # --- USB Sink ---
-    # Bevorzuge Analog Stereo über Digital Stereo (IEC958/S/PDIF)
-    USB_SINK_ID=""
-    USB_SINK_NAME=""
-    USB_SINK_LINE=""
-
-    local usb_sink_analog usb_sink_any
-    usb_sink_analog=$(echo "$sinks_block" | grep -i "usb" | grep -vi "iec958\|digital\|spdif\|s/pdif" | head -1)
-    usb_sink_any=$(echo "$sinks_block" | grep -i "usb" | head -1)
-
-    local usb_sink_line="${usb_sink_analog:-$usb_sink_any}"
-    if [[ -n "$usb_sink_line" ]]; then
-        USB_SINK_ID=$(extract_id "$usb_sink_line")
-        USB_SINK_NAME=$(extract_name "$usb_sink_line")
-        USB_SINK_LINE="$usb_sink_line"
-    fi
-
-    # --- Bluetooth Sink ---
-    BT_SINK_ID=""
-    BT_SINK_NAME=""
-    BT_SINK_LINE=""
-    local bt_sink_line
-    bt_sink_line=$(echo "$sinks_block" | grep -i "haylou\|jabra\|sony\|bose\|airpod\|galaxy\|jbl\|beats\|oneplus" | head -1)
-    if [[ -z "$bt_sink_line" ]]; then
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local lt
-            lt=$(line_type "$line")
-            [[ "$lt" == "internal" || "$lt" == "usb" ]] && continue
-            bt_sink_line="$line"
-            break
-        done <<< "$sinks_block"
-    fi
-    if [[ -n "$bt_sink_line" ]]; then
-        BT_SINK_ID=$(extract_id "$bt_sink_line")
-        BT_SINK_NAME=$(extract_name "$bt_sink_line")
-        BT_SINK_LINE="$bt_sink_line"
-    fi
-
-    # --- Debug ---
-    if (( DEBUG )); then
-        echo -e "  ${DIM}[DEBUG] Default Src:  ID=${CURRENT_SRC_ID} Type=${CURRENT_SRC_TYPE}${NC}"
-        echo -e "  ${DIM}[DEBUG] Default Sink: ID=${CURRENT_SINK_ID} Type=${CURRENT_SINK_TYPE}${NC}"
-        echo -e "  ${DIM}[DEBUG] USB Src:  ${USB_SRC_ID} = ${USB_SRC_NAME}${NC}"
-        echo -e "  ${DIM}[DEBUG] BT Src:   ${BT_SRC_ID} = ${BT_SRC_NAME}${NC}"
-        echo -e "  ${DIM}[DEBUG] USB Sink: ${USB_SINK_ID} = ${USB_SINK_NAME}${NC}"
-        echo -e "  ${DIM}[DEBUG] BT Sink:  ${BT_SINK_ID} = ${BT_SINK_NAME}${NC}"
-        echo ""
-    fi
-}
-
-connection_label() {
-    case "$1" in
-        usb)       echo -e "${GREEN}USB${NC}" ;;
-        bluetooth) echo -e "${CYAN}BT${NC}" ;;
-        internal)  echo -e "${DIM}Intern${NC}" ;;
-        *)         echo -e "${DIM}?${NC}" ;;
-    esac
-}
-
-do_restart() {
-    sleep 1
-    cleanup
-    export _MICCHECK_RESTARTS=$(( RESTART_COUNT + 1 ))
-    exec "$0" "${SCRIPT_ARGS[@]}"
-}
-
-switch_to_device() {
-    local src_id="$1" src_name="$2" sink_id="$3" sink_name="$4"
-
-    echo -e "  ${DIM}Setze Mikrofon  → ${src_name} (${src_id})${NC}"
-    wpctl set-default "$src_id" 2>/dev/null
-
-    if [[ -n "$sink_id" ]]; then
-        echo -e "  ${DIM}Setze Ausgabe   → ${sink_name} (${sink_id})${NC}"
-        wpctl set-default "$sink_id" 2>/dev/null
-    fi
-
-    sleep 0.5
-    echo -e "  ${GREEN}✓${NC} Umgeschaltet"
-    echo ""
-    echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
-    do_restart
-}
-
-# ━━━ ABHÄNGIGKEITEN ━━━
-if ! command -v sox &>/dev/null; then
-    echo -e "${RED}Fehler: 'sox' fehlt!${NC}  → sudo pacman -S sox"
-    exit 1
-fi
-
-# ━━━ Endlosschleifen-Schutz ━━━
-if (( RESTART_COUNT >= MAX_RESTARTS )); then
-    clear
-    echo -e "${RED}${BOLD}Abbruch: Umschalten nach ${MAX_RESTARTS} Versuchen fehlgeschlagen.${NC}"
-    echo ""
-    echo -e "  ${DIM}Debug: ./mic-check.sh --debug${NC}"
-    echo ""
-    tput cnorm
-    exit 1
-fi
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PHASE 1:  System-Check
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-clear
-tput civis
-
-KEEP_LABEL=""
-(( KEEP_DEVICES )) && KEEP_LABEL=" ${DIM}(--keep)${NC}"
-
-detect_devices
-detect_audio_server
-detect_bt_codec
-
-# --- Audio-Server Label ---
-AUDIO_SRV_SHORT=""
-case "$AUDIO_SERVER" in
-    pipewire+pulse|pipewire) AUDIO_SRV_SHORT="PipeWire" ;;
-    pulseaudio)              AUDIO_SRV_SHORT="PulseAudio" ;;
-    *)                       AUDIO_SRV_SHORT="?" ;;
-esac
-[[ -n "$AUDIO_SERVER_VERSION" ]] && AUDIO_SRV_SHORT="${AUDIO_SRV_SHORT} v${AUDIO_SERVER_VERSION}"
-[[ -n "$SESSION_MANAGER" ]] && AUDIO_SRV_SHORT="${AUDIO_SRV_SHORT} + ${SESSION_MANAGER}"
-
-# --- Mic/Out Info ---
-MIC_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)
-MIC_PCT=$(echo "$MIC_VOL" | awk '{printf "%.0f", $2*100}')
-MIC_MUTED=$(echo "$MIC_VOL" | grep -o "MUTED")
-
-OUT_VOL=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
-OUT_PCT=$(echo "$OUT_VOL" | awk '{printf "%.0f", $2*100}')
-OUT_MUTED=$(echo "$OUT_VOL" | grep -o "MUTED")
-
-# --- Status-Kurzform ---
-if [[ -n "$MIC_MUTED" ]]; then
-    MIC_SHORT="${BG_RED}${BOLD}STUMM${NC}"
-elif (( MIC_PCT < 20 )); then
-    MIC_SHORT="${YELLOW}${MIC_PCT}%${NC}"
-else
-    MIC_SHORT="${GREEN}${MIC_PCT}%${NC}"
-fi
-
-if [[ -n "$OUT_MUTED" ]]; then
-    OUT_SHORT="${BG_RED}${BOLD}STUMM${NC}"
-elif (( OUT_PCT < 20 )); then
-    OUT_SHORT="${YELLOW}${OUT_PCT}%${NC}"
-else
-    OUT_SHORT="${GREEN}${OUT_PCT}%${NC}"
-fi
-
-SRC_LABEL=$(connection_label "$CURRENT_SRC_TYPE")
-SINK_LABEL=$(connection_label "$CURRENT_SINK_TYPE")
-MIC_NAME=$(extract_name "$DEFAULT_SRC_LINE")
-OUT_NAME=$(extract_name "$DEFAULT_SINK_LINE")
-
-# --- BT Codec Kurzform ---
-BT_CODEC_SHORT=""
-if [[ -n "$BT_CODEC" ]]; then
-    codec_color="$GREEN"
-    [[ "$BT_CODEC" == "CVSD" ]] && codec_color="$RED"
-    [[ "$BT_CODEC" == "SBC" || "$BT_CODEC" == "SBC-XQ" || "$BT_CODEC" == "AAC" ]] && codec_color="$YELLOW"
-    BT_CODEC_SHORT="Codec: ${codec_color}${BT_CODEC}${NC}"
-fi
-
-# ━━━ HEADER (Wide Compact) ━━━
-echo -e "  ${BOLD}🎧🎙 MIC CHECK${NC}${KEEP_LABEL} ${DIM}v${VERSION}${NC} ─── ${DIM}${AUDIO_SRV_SHORT}${NC} ─── ${BOLD}${MIC_NAME}${NC} ${DIM}[${NC}${SRC_LABEL}${DIM}]${NC}"
-echo -e "  Mic: ${MIC_SHORT}  Out: ${OUT_SHORT}  ${BT_CODEC_SHORT}"
-
-# --- BT-Profile (kompakt, gruppiert nach Typ) ---
-if [[ -n "$BT_SRC_ID" || -n "$BT_SINK_ID" ]] && [[ ${#BT_ALL_PROFILES[@]} -gt 0 ]]; then
-    echo ""
-    echo -e "  ${DIM}BT-Profile:${NC}"
-    output_line="" headset_line=""
-    for p in "${BT_ALL_PROFILES[@]}"; do
-        entry="$p"
-        [[ "$p" == "$BT_PROFILE" ]] && entry="${p} ${CYAN}(aktiv)${NC}${DIM}"
-        if echo "$p" | grep -qi 'headset\|handsfree\|hfp\|head.unit'; then
-            [[ -n "$headset_line" ]] && headset_line+=" | "
-            headset_line+="$entry"
-        else
-            [[ -n "$output_line" ]] && output_line+=" | "
-            output_line+="$entry"
+# Hauptschleife statt Neustart per exec: nach einem Umschalten werden die
+# Geräte neu erkannt; Optionen und Entscheidungen bleiben erhalten.
+while :; do
+    REDETECT=0
+    NEXT_ACTION="quit"
+    (( IS_TTY && !NO_CLEAR )) && clear
+    cur_hide
+    run_check
+    if (( REDETECT )); then
+        (( ++auto_switches ))
+        if (( auto_switches > MAX_AUTO_SWITCHES )); then
+            say ""
+            say "${RED}${BOLD}Abbruch: Geräte-Umschaltung wiederholt sich (${MAX_AUTO_SWITCHES}×).${NC}"
+            say "  ${DIM}Debug: ./mic-check.sh --debug   ·   Geräte beibehalten: --keep${NC}"
+            exit 1
         fi
-    done
-    [[ -n "$output_line" ]] && echo -e "    🎧  ${DIM}${output_line}${NC}"
-    [[ -n "$headset_line" ]] && echo -e "    🎧🎙 ${DIM}${headset_line}${NC}"
-fi
-echo ""
-
-# ━━━ SMART ROUTING (nur ohne --keep) ━━━
-if (( KEEP_DEVICES == 0 )); then
-    tput cnorm
-
-    # Auto-Switch: BT auf Handsfree mSBC wenn A2DP oder CVSD aktiv
-    if [[ "$CURRENT_SRC_TYPE" == "bluetooth" || "$CURRENT_SINK_TYPE" == "bluetooth" ]]; then
-        if [[ "$BT_CODEC" != "mSBC" && -n "$BT_CODEC" ]]; then
-            switch_bt_to_msbc
-        fi
+        say ""
+        say "  ${BOLD}${I_REDO} Erkenne Geräte neu…${NC}"
+        sleep 0.7
+        continue
     fi
-
-    # Auto-Fix: Mic=USB aber Ausgabe≠USB
-    if [[ "$CURRENT_SRC_TYPE" == "usb" && "$CURRENT_SINK_TYPE" != "usb" && -n "$USB_SINK_ID" ]]; then
-        echo -e "  ${YELLOW}⚠${NC}  Mikrofon ist USB, aber Ausgabe ist $(connection_label "$CURRENT_SINK_TYPE")"
-        echo -e "  ${DIM}Korrigiere Ausgabe auf USB...${NC}"
-        echo -e "  ${DIM}→ $(extract_display "$USB_SINK_LINE")${NC}"
-        wpctl set-default "$USB_SINK_ID" 2>/dev/null
-        echo -e "  ${GREEN}✓${NC} Ausgabe umgeschaltet"
-        echo ""
-        echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
-        do_restart
-    fi
-
-    # Auto-Fix: Mic=BT aber Ausgabe≠BT
-    if [[ "$CURRENT_SRC_TYPE" == "bluetooth" && "$CURRENT_SINK_TYPE" != "bluetooth" && -n "$BT_SINK_ID" ]]; then
-        echo -e "  ${YELLOW}⚠${NC}  Mikrofon ist BT, aber Ausgabe ist $(connection_label "$CURRENT_SINK_TYPE")"
-        echo -e "  ${DIM}Korrigiere Ausgabe auf BT...${NC}"
-        echo -e "  ${DIM}→ $(extract_display "$BT_SINK_LINE")${NC}"
-        wpctl set-default "$BT_SINK_ID" 2>/dev/null
-        echo -e "  ${GREEN}✓${NC} Ausgabe umgeschaltet"
-        echo ""
-        echo -e "  ${BOLD}↻ Starte Mic-Check neu...${NC}"
-        do_restart
-    fi
-
-    # Vorschlag: USB verfügbar und nicht aktiv
-    if [[ "$CURRENT_SRC_TYPE" != "usb" && -n "$USB_SRC_ID" ]]; then
-        echo -e "  ${GREEN}●${NC} USB-Headset erkannt: ${BOLD}${USB_SRC_NAME}${NC}"
-        echo -e "    ${DIM}Aktuell: $(connection_label "$CURRENT_SRC_TYPE")${NC}"
-        echo ""
-        read -r -p "    Auf USB umschalten (Mic + Ausgabe)? [J/n] " answer
-        answer=${answer:-j}
-        if [[ "$answer" =~ ^[jJyY]$ ]]; then
-            echo ""
-            switch_to_device "$USB_SRC_ID" "$USB_SRC_NAME" "$USB_SINK_ID" "$USB_SINK_NAME"
-        fi
-        echo ""
-    fi
-
-    # Vorschlag: Mic=Intern, kein USB, BT verfügbar
-    if [[ "$CURRENT_SRC_TYPE" == "internal" && -z "$USB_SRC_ID" && -n "$BT_SRC_ID" ]]; then
-        echo -e "  ${CYAN}●${NC} Bluetooth-Headset erkannt: ${BOLD}${BT_SRC_NAME}${NC}"
-        echo -e "    ${DIM}Aktuell wird das interne Mikrofon verwendet.${NC}"
-        echo ""
-        read -r -p "    Auf Bluetooth umschalten (Mic + Ausgabe)? [J/n] " answer
-        answer=${answer:-j}
-        if [[ "$answer" =~ ^[jJyY]$ ]]; then
-            echo ""
-            switch_to_device "$BT_SRC_ID" "$BT_SRC_NAME" "$BT_SINK_ID" "$BT_SINK_NAME"
-        fi
-        echo ""
-    fi
-
-    tput civis
-fi
-
-# Bei MUTE abbrechen
-if [[ -n "$MIC_MUTED" ]]; then
-    echo -e "  ${RED}${BOLD}✗ Mikrofon ist stumm!${NC}  ${DIM}→ wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0${NC}"
-    echo ""
-    tput cnorm
-    exit 1
-fi
-
-# ━━━ PHASE 1.5: Noise Floor (kompakt) ━━━
-printf "  🔇 Rauschboden-Messung ${DIM}(Bitte 1s still sein...)${NC}: "
-measure_noise_floor
-
-if [[ "$NOISE_DB" == "-inf" ]]; then
-    echo -e "${GREEN}Kein Rauschen${NC}"
-elif (( NOISE_PEAK < 200 )); then
-    echo -e "${GREEN}${NOISE_DB} dB${NC} ${DIM}(sehr gut)${NC}"
-elif (( NOISE_PEAK < 800 )); then
-    echo -e "${YELLOW}${NOISE_DB} dB${NC} ${DIM}(akzeptabel)${NC}"
-else
-    echo -e "${RED}${NOISE_DB} dB${NC} ${DIM}(zu hoch)${NC}"
-fi
-echo ""
-
-# ━━━ PHASE 2: Live-Pegel (INPUT-Zeile als einzige Anzeige) ━━━
-printf "  🎙 INPUT   $(draw_bar 0)  ${DIM}warte auf Pegel...${NC}"
-
-# --- Phase 2a: Warte bis zu 3s auf Signal ---
-WAIT_PIPE=$(mktemp -u /tmp/micwait.XXXXXX)
-mkfifo "$WAIT_PIPE"
-
-rec -q -c $CHANNELS -r $RATE -b $BITS -e signed-integer -t raw - \
-    trim 0 3 2>/dev/null > "$WAIT_PIPE" &
-WAIT_PID=$!
-
-exec 5<"$WAIT_PIPE"
-
-SIGNAL_DETECTED=0
-WAIT_MAX=$(( 3 * 5 ))
-wait_i=0
-
-while (( wait_i < WAIT_MAX )); do
-    chunk_data=$(dd bs=$CHUNK_BYTES count=1 iflag=fullblock <&5 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
-    peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
-    [[ -z "$peak" ]] && peak=0
-
-    printf "\r  🎙 INPUT   $(draw_bar "$peak")  ${DIM}warte auf Pegel...${NC}\033[K"
-
-    if (( peak > 500 )); then
-        SIGNAL_DETECTED=1
-        break
-    fi
-    (( wait_i++ ))
+    auto_switches=0
+    [[ "$NEXT_ACTION" == repeat ]] && continue
+    break
 done
 
-exec 5<&-
-kill "$WAIT_PID" 2>/dev/null
-wait "$WAIT_PID" 2>/dev/null
-rm -f "$WAIT_PIPE"
-
-# --- Phase 2b: Aufnahme mit Countdown ---
-printf "\r  🎙 INPUT   $(draw_bar 0)  ${DIM}Sprich ${CHECK_SECS}s lang... ⏱ ${CHECK_SECS}s${NC}\033[K"
-
-MIC_PIPE=$(mktemp -u /tmp/micpipe.XXXXXX)
-mkfifo "$MIC_PIPE"
-
-rec -q -c $CHANNELS -r $RATE -b $BITS -e signed-integer -t raw - \
-    trim 0 $CHECK_SECS 2>/dev/null \
-    | tee "$FILE" > "$MIC_PIPE" &
-REC_PID=$!
-
-exec 3<"$MIC_PIPE"
-
-max_peak=0
-chunk_i=0
-
-while (( chunk_i < CHUNK_COUNT )); do
-    chunk_data=$(dd bs=$CHUNK_BYTES count=1 iflag=fullblock <&3 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
-
-    peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
-    [[ -z "$peak" ]] && peak=0
-    (( peak > max_peak )) && max_peak=$peak
-
-    # Verbleibende Sekunden = aufgerundete restliche Chunks (5 Chunks = 1s)
-    remaining=$(( (CHUNK_COUNT - chunk_i + 4) / 5 ))
-
-    printf "\r  🎙 INPUT   $(draw_bar "$peak")  ${DIM}Sprich ${CHECK_SECS}s lang... ⏱ %ds${NC}\033[K" "$remaining"
-
-    (( chunk_i++ ))
-done
-
-exec 3<&-
-wait "$REC_PID" 2>/dev/null
-rm -f "$MIC_PIPE"
-MIC_PIPE=""
-
-# --- INPUT Ergebnis ---
-printf "\r  🎙 INPUT   $(draw_vu "$max_peak")\033[K"
-
-# ━━━ PEGEL-BEWERTUNG ━━━
-if (( max_peak < 300 )); then
-    echo ""
-    echo -e "  ${RED}${BOLD}✗ KEIN SIGNAL${NC} – Mic empfängt nichts!"
-    echo ""
-
-    # Fehlschlag protokollieren (vor jedem Exit / Neustart)
-    VERDICT="FAIL"
-    log_result
-
-    if (( KEEP_DEVICES == 1 )); then
-        echo -e "  ${DIM}(--keep aktiv, kein Gerätewechsel)${NC}"
-        echo ""
-        echo -e "  ${BG_RED}${BOLD} ✗ MIKROFON PROBLEM – NICHT ANRUFEN ${NC}"
-        echo ""
-        tput cnorm
-        exit 1
-    fi
-
-    tput cnorm
-    SWITCHED=0
-
-    if [[ -n "$USB_SRC_ID" && "$CURRENT_SRC_TYPE" != "usb" ]]; then
-        echo -e "  ${GREEN}●${NC} USB verfügbar: ${BOLD}${USB_SRC_NAME}${NC}"
-        read -r -p "    Auf USB umschalten? [J/n] " answer
-        answer=${answer:-j}
-        if [[ "$answer" =~ ^[jJyY]$ ]]; then
-            echo ""
-            switch_to_device "$USB_SRC_ID" "$USB_SRC_NAME" "$USB_SINK_ID" "$USB_SINK_NAME"
-            SWITCHED=1
-        fi
-    fi
-
-    if (( SWITCHED == 0 )) && [[ -n "$BT_SRC_ID" && "$CURRENT_SRC_TYPE" != "bluetooth" ]]; then
-        echo -e "  ${CYAN}●${NC} BT verfügbar: ${BOLD}${BT_SRC_NAME}${NC}"
-        read -r -p "    Auf Bluetooth umschalten? [J/n] " answer
-        answer=${answer:-j}
-        if [[ "$answer" =~ ^[jJyY]$ ]]; then
-            echo ""
-            switch_to_device "$BT_SRC_ID" "$BT_SRC_NAME" "$BT_SINK_ID" "$BT_SINK_NAME"
-            SWITCHED=1
-        fi
-    fi
-
-    if (( SWITCHED == 0 )); then
-        echo -e "  ${DIM}Tipps: Kabel prüfen · Mute-Schalter · ./mic-check.sh --debug${NC}"
-        echo ""
-        echo -e "  ${BG_RED}${BOLD} ✗ MIKROFON PROBLEM – NICHT ANRUFEN ${NC}"
-        echo ""
-        tput cnorm
-        exit 1
-    fi
-
-elif (( max_peak < 2000 )); then
-    VERDICT="WARN"
-elif (( max_peak > 30000 )); then
-    VERDICT="WARN"
-else
-    VERDICT="OK"
-fi
-
-# ━━━ PHASE 3: Wiedergabe (sequenziell) ━━━
-if [[ -s "$FILE" && -n "$VERDICT" ]]; then
-    # Cursor ist am Ende der INPUT-Zeile – zeige "Warte..." während Wiedergabe startet
-    printf "  ${DIM}Warte...${NC}"
-
-    PLAY_PIPE=$(mktemp -u /tmp/playpipe.XXXXXX)
-    mkfifo "$PLAY_PIPE"
-
-    sox -q -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer "$FILE" \
-        -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer - 2>/dev/null \
-        | tee >(sox -q -t raw -r $RATE -c $CHANNELS -b $BITS -e signed-integer - \
-                -d 2>/dev/null) > "$PLAY_PIPE" &
-    PLAY_PID=$!
-
-    exec 4<"$PLAY_PIPE"
-
-    playback_first=1
-    while true; do
-        chunk_data=$(dd bs=$CHUNK_BYTES count=1 iflag=fullblock <&4 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
-        peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
-        [[ -z "$peak" ]] && peak=0
-
-        if (( peak == 0 )); then
-            kill -0 "$PLAY_PID" 2>/dev/null || break
-        fi
-
-        if (( playback_first )); then
-            # INPUT finalisieren (Warte... → ✓), OUTPUT starten
-            printf "\r  🎙 INPUT   $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
-            printf "  🔊 OUTPUT $(draw_vu "$peak")\033[K"
-            playback_first=0
-        else
-            printf "\r  🔊 OUTPUT $(draw_vu "$peak")\033[K"
-        fi
-    done
-
-    exec 4<&-
-    wait "$PLAY_PID" 2>/dev/null
-    rm -f "$PLAY_PIPE"
-    PLAY_PIPE=""
-
-    # Finale Anzeige
-    if (( playback_first )); then
-        # Wiedergabe hatte keine Frames – kein Output-Pegel gemessen
-        printf "\r  🎙 INPUT   $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
-        printf "  🔊 OUTPUT $(draw_vu 0) ${GREEN}✓${NC}\033[K\n"
-    else
-        printf "\r  🔊 OUTPUT $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
-    fi
-else
-    # Kein Playback, INPUT finalisieren
-    if [[ -n "$VERDICT" ]]; then
-        printf " ${GREEN}✓${NC}\033[K\n"
-    fi
-fi
-echo ""
-
-# ━━━ SNR + Frequenzgang (kompakt, eine Zeile) ━━━
-if [[ -n "$VERDICT" ]]; then
-    calculate_snr
-    check_frequency_response
-
-    STATS_LINE="  "
-
-    # Pegel-Bewertung
-    if [[ "$VERDICT" == "OK" ]]; then
-        STATS_LINE+="${GREEN}✓ Pegel OK${NC}"
-    elif (( max_peak < 2000 )); then
-        STATS_LINE+="${YELLOW}⚠ Sehr leise${NC}"
-    else
-        STATS_LINE+="${YELLOW}⚠ Clipping${NC}"
-    fi
-
-    # SNR
-    if [[ -n "$SNR_DB" ]]; then
-        local_snr_int=${SNR_DB%%.*}
-        snr_color="$GREEN"
-        (( local_snr_int < 25 )) && snr_color="$YELLOW"
-        (( local_snr_int < 15 )) && snr_color="$RED"
-        STATS_LINE+=" │ SNR: ${snr_color}${SNR_DB}dB${NC} ${DIM}(${SNR_RATING})${NC}"
-    fi
-
-    # Frequenz
-    if [[ -n "$FREQ_OK" ]]; then
-        if [[ "$FREQ_OK" == "OK" ]]; then
-            STATS_LINE+=" │ Freq: ${GREEN}>4kHz ✓${NC}"
-        else
-            STATS_LINE+=" │ Freq: ${YELLOW}≤4kHz${NC}"
-        fi
-    fi
-
-    echo -e "$STATS_LINE"
-    echo ""
-fi
-
-# ━━━ ERGEBNIS ━━━
-# Ergebnis loggen
-if [[ -n "$VERDICT" ]]; then
-    log_result
-fi
-
-case "$VERDICT" in
-    OK)
-        echo -e "  ══ ${BG_GREEN}${BOLD} ✅ BEREIT FÜR DEN ANRUF ${NC} ${DIM}(log:${LOG_FILE})${NC} ══"
-        ;;
-    WARN)
-        echo -e "  ══ ${YELLOW}${BOLD} ⚠  PEGEL ANPASSEN ${NC} ${DIM}(log:${LOG_FILE})${NC} ══"
-        ;;
-esac
-
-echo ""
-tput cnorm
+[[ "$VERDICT" == FAIL ]] && exit 1
+exit 0
