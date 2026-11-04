@@ -88,6 +88,7 @@ show_history() {
 # --- OPTIONEN ---
 KEEP_DEVICES=0
 DEBUG=0
+SCRIPT_ARGS=("$@")   # Original-Argumente für Restart (exec) merken
 for arg in "$@"; do
     case "$arg" in
         --help|-h)    show_help ;;
@@ -243,9 +244,12 @@ countdown_switch() {
     local seconds="${2:-3}"
 
     tput cnorm
-    for (( i=seconds; i>0; i-- )); do
-        printf "\r    ${YELLOW}⏳ ${message} in ${BOLD}${i}s${NC}${YELLOW} – [Leertaste] zum Überspringen${NC}  "
-        # read mit 1s Timeout, einzelnes Zeichen
+    local key end remain
+    end=$(( $(date +%s) + seconds ))
+    while (( (remain = end - $(date +%s)) > 0 )); do
+        printf "\r    ${YELLOW}⏳ ${message} in ${BOLD}${remain}s${NC}${YELLOW} – [Leertaste] zum Überspringen${NC}  "
+        # read mit 1s Timeout, einzelnes Zeichen. Restzeit kommt aus der Uhr,
+        # daher kürzen Nicht-Skip-Tasten den Countdown nicht ab.
         if read -r -s -n 1 -t 1 key 2>/dev/null; then
             if [[ "$key" == "" || "$key" == " " ]]; then
                 printf "\r    ${DIM}↷ Übersprungen.${NC}%40s\n"
@@ -726,7 +730,7 @@ do_restart() {
     sleep 1
     cleanup
     export _MICCHECK_RESTARTS=$(( RESTART_COUNT + 1 ))
-    exec "$0" "$@"
+    exec "$0" "${SCRIPT_ARGS[@]}"
 }
 
 switch_to_device() {
@@ -959,7 +963,7 @@ WAIT_MAX=$(( 3 * 5 ))
 wait_i=0
 
 while (( wait_i < WAIT_MAX )); do
-    chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&5 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
+    chunk_data=$(dd bs=$CHUNK_BYTES count=1 iflag=fullblock <&5 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
     peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
     [[ -z "$peak" ]] && peak=0
 
@@ -994,13 +998,14 @@ max_peak=0
 chunk_i=0
 
 while (( chunk_i < CHUNK_COUNT )); do
-    chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&3 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
+    chunk_data=$(dd bs=$CHUNK_BYTES count=1 iflag=fullblock <&3 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
 
     peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
     [[ -z "$peak" ]] && peak=0
     (( peak > max_peak )) && max_peak=$peak
 
-    remaining=$(( CHECK_SECS - chunk_i / 5 ))
+    # Verbleibende Sekunden = aufgerundete restliche Chunks (5 Chunks = 1s)
+    remaining=$(( (CHUNK_COUNT - chunk_i + 4) / 5 ))
 
     printf "\r  🎙 INPUT   $(draw_bar "$peak")  ${DIM}Sprich ${CHECK_SECS}s lang... ⏱ %ds${NC}\033[K" "$remaining"
 
@@ -1020,6 +1025,10 @@ if (( max_peak < 300 )); then
     echo ""
     echo -e "  ${RED}${BOLD}✗ KEIN SIGNAL${NC} – Mic empfängt nichts!"
     echo ""
+
+    # Fehlschlag protokollieren (vor jedem Exit / Neustart)
+    VERDICT="FAIL"
+    log_result
 
     if (( KEEP_DEVICES == 1 )); then
         echo -e "  ${DIM}(--keep aktiv, kein Gerätewechsel)${NC}"
@@ -1090,7 +1099,7 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
 
     playback_first=1
     while true; do
-        chunk_data=$(dd bs=$CHUNK_BYTES count=1 <&4 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
+        chunk_data=$(dd bs=$CHUNK_BYTES count=1 iflag=fullblock <&4 2>/dev/null | od -An -td2 -v | tr -s ' \n' '\n')
         peak=$(echo "$chunk_data" | awk 'BEGIN{m=0} $1!=""{v=$1+0; if(v<0)v=-v; if(v>m)m=v} END{print m+0}')
         [[ -z "$peak" ]] && peak=0
 
@@ -1115,9 +1124,9 @@ if [[ -s "$FILE" && -n "$VERDICT" ]]; then
 
     # Finale Anzeige
     if (( playback_first )); then
-        # Wiedergabe hatte keine Frames
+        # Wiedergabe hatte keine Frames – kein Output-Pegel gemessen
         printf "\r  🎙 INPUT   $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
-        printf "  🔊 OUTPUT $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
+        printf "  🔊 OUTPUT $(draw_vu 0) ${GREEN}✓${NC}\033[K\n"
     else
         printf "\r  🔊 OUTPUT $(draw_vu "$max_peak") ${GREEN}✓${NC}\033[K\n"
     fi
